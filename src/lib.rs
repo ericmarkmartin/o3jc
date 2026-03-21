@@ -20,6 +20,9 @@ pub use types::*;
 // ---------------------------------------------------------------------------
 
 /// Intern `name` and return its unique selector.
+///
+/// # Safety
+/// `name` must be a valid, non-null, null-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sel_registerName(name: *const std::ffi::c_char) -> SEL {
     // SAFETY: caller (C code) guarantees `name` is a valid null-terminated C string.
@@ -27,12 +30,19 @@ pub unsafe extern "C" fn sel_registerName(name: *const std::ffi::c_char) -> SEL 
 }
 
 /// Return the null-terminated name string of a selector.
+///
+/// # Safety
+/// `sel` must be a valid interned selector returned by `sel_registerName`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sel_getName(sel: SEL) -> *const std::ffi::c_char {
     sel::sel_get_name(sel)
 }
 
 /// Allocate a new (unregistered) class+metaclass pair.
+///
+/// # Safety
+/// `superclass` must be null or point to a live registered `ObjcClass`.
+/// `name` must be a valid, non-null, null-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn objc_allocateClassPair(
     superclass: Class,
@@ -45,6 +55,9 @@ pub unsafe extern "C" fn objc_allocateClassPair(
 }
 
 /// Register an allocated class pair into the live class table.
+///
+/// # Safety
+/// `cls` must have been returned by `objc_allocateClassPair`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn objc_registerClassPair(cls: Class) {
     // SAFETY: caller (C code) guarantees `cls` was returned by `objc_allocateClassPair`.
@@ -52,6 +65,9 @@ pub unsafe extern "C" fn objc_registerClassPair(cls: Class) {
 }
 
 /// Look up a registered class by C-string name.
+///
+/// # Safety
+/// `name` must be a valid, non-null, null-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn objc_getClass(name: *const std::ffi::c_char) -> Class {
     // SAFETY: caller (C code) guarantees `name` is a valid null-terminated C string.
@@ -62,6 +78,11 @@ pub unsafe extern "C" fn objc_getClass(name: *const std::ffi::c_char) -> Class {
 }
 
 /// Add a method to a class.
+///
+/// # Safety
+/// `cls` must be a valid non-null `ObjcClass`. `sel` must be an interned selector.
+/// `imp` must be a valid function pointer compatible with `types`. `types` must be
+/// null or a valid null-terminated type-encoding string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn class_addMethod(
     cls: Class,
@@ -82,7 +103,10 @@ pub unsafe extern "C" fn class_addMethod(
 /// `Option<IMP>` is guaranteed by Rust to have the same layout as a nullable
 /// function pointer, so C callers see either a valid IMP or null.
 ///
-/// (Dynamic resolution and forwarding are added in Phase 4.)
+/// (Dynamic resolution and forwarding are added in a later phase.)
+///
+/// # Safety
+/// `receiver` must be null or point to a live `ObjcObject`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn objc_msg_lookup(receiver: Id, sel: SEL) -> Option<IMP> {
     // SAFETY: caller (C code) guarantees `receiver` is null or a valid live ObjcObject.

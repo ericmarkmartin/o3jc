@@ -135,12 +135,6 @@ pub unsafe fn class_add_method(cls: Class, sel: SEL, imp: IMP, types: *const c_c
     // SAFETY: `list` was either just created by `MethodList::new` (valid by construction)
     // or was previously inserted and has not been freed; no other reference exists here.
     let list = unsafe { list.as_mut() };
-    for entry in &list.entries {
-        if entry.sel == sel {
-            false;
-        }
-    }
-
     if list.entries.iter().any(|entry| entry.sel == sel) {
         false
     } else {

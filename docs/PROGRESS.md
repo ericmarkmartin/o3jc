@@ -4,19 +4,17 @@
 
 **Milestone:** Define a class, add methods, dispatch works (no cache)
 
-**Source:** `~/o3jc/` (initial session working directory)
-
 ### What was built
 
 | File | Description |
 |---|---|
 | `src/types.rs` | Core `#[repr(C)]` types: `ObjcObject`, `ObjcClass`, `MethodEntry`, `MethodList`, type aliases (`SEL`, `IMP`, `Id`, `Class`), `class_flags` |
-| `src/sel.rs` | Selector intern table: `DashMap<Box<str>, usize>` keyed by name, pointer equality guaranteed |
+| `src/sel.rs` | Selector intern table: `LazyLock<DashMap<Box<str>, usize>>`, pointer equality guaranteed |
 | `src/class_registry.rs` | `objc_allocate_class_pair`, `objc_register_class_pair`, `objc_get_class_str`, `class_add_method` |
-| `src/msg_send.rs` | `class_lookup_method` (hierarchy walk), `objc_msg_lookup` (returns `Option<IMP>`) |
+| `src/msg_send.rs` | `class_lookup_method` (hierarchy walk via `std::iter::successors`), `objc_msg_lookup` (returns `Option<IMP>`) |
 | `src/lib.rs` | Module declarations, `#[unsafe(no_mangle)]` C ABI surface, 7 unit tests |
 
-### C ABI exports (Phase 1)
+### C ABI exports
 
 ```c
 SEL      sel_registerName(const char *name);
@@ -40,11 +38,16 @@ IMP      objc_msg_lookup(id receiver, SEL sel);   // GNUstep-style; nullable
 
 ### Key implementation notes
 
-- **Rust edition 2024**: `#[no_mangle]` must be written `#[unsafe(no_mangle)]`; explicit `unsafe {}` blocks required inside `unsafe fn`
-- **Nullable IMP**: C ABI `objc_msg_lookup` returns `Option<IMP>` — Rust's niche optimization makes `Option<fn()>` layout-compatible with a nullable function pointer
-- **SEL storage**: `DashMap<Box<str>, usize>` (usize = pointer address) avoids the `Send` bound issue with raw pointer values
-- **Class registry**: `RwLock<HashMap<Box<str>, usize>>` (same usize trick)
-- **Method lists**: Rust `Vec<MethodEntry>` for now (not a C inline array); ABI-compatible layout comes with the method cache in Phase 2
+- **Rust edition 2024**: `#[no_mangle]` must be written `#[unsafe(no_mangle)]`; explicit `unsafe {}` blocks required inside `unsafe fn`; all `unsafe` blocks have `// SAFETY:` justifications
+- **Nullable IMP**: `objc_msg_lookup` returns `Option<IMP>` — Rust's niche optimization makes `Option<fn()>` layout-compatible with a nullable function pointer
+- **Selector table**: `LazyLock<DashMap<Box<str>, usize>>` — `usize` stores the pointer address to satisfy `DashMap`'s `Send` bound; each selector string is leaked via `CString::into_raw` for `'static` stability
+- **Class registry**: `LazyLock<RwLock<HashMap<Box<str>, SendClass>>>` — `SendClass(*mut ObjcClass)` newtype with `unsafe impl Send + Sync` allows the raw pointer to live in the map; the `RwLock` provides the actual synchronization
+- **Nullable pointer fields**: `ObjcClass.isa`, `ObjcClass.super_class`, and `MethodList.next` are `Option<NonNull<_>>` — FFI-safe due to Rust's guaranteed null-pointer optimization, and cleaner than raw pointer null checks
+- **`ObjcObject.isa`**: `NonNull<ObjcClass>` (non-optional) — valid objects always have a non-null isa
+- **`ObjcClass.method_list`**: `Option<NonNull<MethodList>>` — `None` when no methods have been added; lazily initialized by `class_add_method` via `get_or_insert_with(MethodList::new)`
+- **Method dispatch**: `search_method_lists` and `class_lookup_method` use `std::iter::successors` to walk linked lists, with `find_map`/`flat_map` for clean short-circuiting
+- **Method lists**: `Vec<MethodEntry>` for now (not a C inline array); ABI-compatible layout comes in Phase 2
+- **Pre-registration discipline**: `class_add_method` must only be called before `objc_registerClassPair`; nothing enforces this in the type system, but violating it is a data race on `method_list`
 
 ### `Cargo.toml` dependencies
 

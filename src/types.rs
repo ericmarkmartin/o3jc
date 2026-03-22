@@ -32,7 +32,11 @@ pub struct ObjcSelector {
 pub type SEL = NonNull<ObjcSelector>;
 
 /// An opaque object reference (`id` in Objective-C).
-pub type Id = *mut ObjcObject;
+///
+/// `None` is the equivalent of Objective-C `nil`. `Option<NonNull<T>>` has the
+/// null-pointer niche optimization, so it is ABI-compatible with `*mut T` at
+/// the C boundary.
+pub type Id = Option<NonNull<ObjcObject>>;
 
 /// A method implementation.
 ///

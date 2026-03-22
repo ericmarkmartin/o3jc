@@ -49,6 +49,10 @@ typedef struct objc_selector *SEL;
 
 /**
  * An opaque object reference (`id` in Objective-C).
+ *
+ * `None` is the equivalent of Objective-C `nil`. `Option<NonNull<T>>` has the
+ * null-pointer niche optimization, so it is ABI-compatible with `*mut T` at
+ * the C boundary.
  */
 typedef struct objc_object *Id;
 

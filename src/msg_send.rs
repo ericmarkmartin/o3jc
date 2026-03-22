@@ -56,7 +56,7 @@ pub unsafe fn class_lookup_method(cls: Option<NonNull<ObjcClass>>, sel: SEL) -> 
 /// # Safety
 /// `receiver` must be null or point to a live `ObjcObject`.
 pub unsafe fn objc_msg_lookup(receiver: Id, sel: SEL) -> Option<IMP> {
-    let receiver = NonNull::new(receiver)?;
+    let receiver = receiver?;
     // SAFETY: caller guarantees `receiver` is non-null and points to a live ObjcObject;
     // NonNull::new above confirmed non-null, so dereferencing is valid.
     let cls = unsafe { receiver.as_ref().isa };

@@ -1,13 +1,16 @@
 //! **o3jc** — an Objective-C runtime implemented in Rust.
 //!
-//! Phase 2 adds: per-class method cache (fast dispatch path),
-//! post-registration `class_addMethod`, and `method_exchangeImplementations`.
+//! Phase 3 adds: retain/release side tables, autorelease pools, and weak references.
 
+pub mod autorelease;
 pub mod class_registry;
 pub mod method_cache;
 pub mod msg_send;
+pub mod retain_release;
 pub mod sel;
 pub mod types;
+
+use std::ptr::NonNull;
 
 pub use class_registry::{
     class_add_method, class_get_instance_method, class_replace_method,
@@ -169,6 +172,109 @@ pub unsafe extern "C" fn objc_msg_lookup(receiver: Id, sel: SEL) -> Option<IMP> 
 }
 
 // ---------------------------------------------------------------------------
+// C ABI surface — retain / release / autorelease (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Increment `obj`'s retain count and return it.
+///
+/// # Safety
+/// `obj` must be null or point to a live `ObjcObject`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_retain(obj: Id) -> Id {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { retain_release::objc_retain(obj) }
+}
+
+/// Decrement `obj`'s retain count; deallocate if it reaches zero.
+///
+/// # Safety
+/// `obj` must be null or point to a live `ObjcObject`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_release(obj: Id) {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { retain_release::objc_release(obj) }
+}
+
+/// Add `obj` to the current autorelease pool and return it.
+///
+/// # Safety
+/// `obj` must be null or point to a live `ObjcObject`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_autorelease(obj: Id) -> Id {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { autorelease::objc_autorelease(obj) }
+}
+
+/// Push a new autorelease pool; returns an opaque token for the matching pop.
+#[unsafe(no_mangle)]
+pub extern "C" fn objc_autoreleasePoolPush() -> *mut () {
+    autorelease::objc_autorelease_pool_push()
+}
+
+/// Pop autorelease pools back to `token`, releasing all objects added since.
+///
+/// # Safety
+/// `token` must be a value returned by `objc_autoreleasePoolPush` on the same
+/// thread, not yet consumed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_autoreleasePoolPop(token: *mut ()) {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { autorelease::objc_autorelease_pool_pop(token) }
+}
+
+/// Initialise the weak-pointer location `*location` to `obj`.
+///
+/// # Safety
+/// `location` must be a valid writable pointer. `obj` must be null or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_initWeak(location: NonNull<Id>, obj: Id) -> Id {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { retain_release::objc_init_weak(location, obj) }
+}
+
+/// Update the weak-pointer location `*location` to `new_obj`.
+///
+/// # Safety
+/// `location` must have been initialised by `objc_initWeak`. `new_obj` must be
+/// null or point to a live `ObjcObject`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_storeWeak(location: NonNull<Id>, new_obj: Id) -> Id {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { retain_release::objc_store_weak(location, new_obj) }
+}
+
+/// Load the weak pointer at `location`, returning a +1 retained reference or
+/// null if the object has been deallocated. The caller must release the result.
+///
+/// # Safety
+/// `location` must have been initialised by `objc_initWeak`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_loadWeakRetained(location: NonNull<Id>) -> Id {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { retain_release::objc_load_weak_retained(location) }
+}
+
+/// Load the weak pointer at `location` (autoreleased; null if deallocated).
+///
+/// # Safety
+/// `location` must have been initialised by `objc_initWeak`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_loadWeak(location: NonNull<Id>) -> Id {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { retain_release::objc_load_weak(location) }
+}
+
+/// Unregister and clear the weak-pointer location `*location`.
+///
+/// # Safety
+/// `location` must have been initialised by `objc_initWeak`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn objc_destroyWeak(location: NonNull<Id>) {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { retain_release::objc_destroy_weak(location) }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -264,7 +370,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id = &mut obj as Id;
+            let id: Id = Some(NonNull::from(&mut obj));
 
             let found = objc_msg_lookup(id, sel);
             assert!(found.is_some(), "IMP must be found for registered method");
@@ -308,7 +414,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(child).unwrap(),
             };
-            let id = &mut obj as Id;
+            let id: Id = Some(NonNull::from(&mut obj));
 
             let found = objc_msg_lookup(id, sel);
             assert!(
@@ -331,7 +437,7 @@ mod tests {
         let sel_name = CString::new("anyMethod").unwrap();
         unsafe {
             let sel = sel_registerName(sel_name.as_ptr());
-            let imp = objc_msg_lookup(std::ptr::null_mut(), sel);
+            let imp = objc_msg_lookup(None, sel);
             assert!(imp.is_none(), "null receiver must yield null IMP");
         }
     }
@@ -374,7 +480,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(child).unwrap(),
             };
-            let id = &mut obj as Id;
+            let id: Id = Some(NonNull::from(&mut obj));
 
             let found = objc_msg_lookup(id, sel);
             assert!(found.is_some());
@@ -418,7 +524,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id = &mut obj as Id;
+            let id: Id = Some(NonNull::from(&mut obj));
 
             // First lookup: slow path, fills cache.
             let found1 = objc_msg_lookup(id, sel);
@@ -473,7 +579,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id = &mut obj as Id;
+            let id: Id = Some(NonNull::from(&mut obj));
 
             // Warm the cache for sel_a.
             let _ = objc_msg_lookup(id, sel_a);
@@ -502,6 +608,130 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 3: retain / release
+
+    #[test]
+    fn retain_release_count() {
+        let class_name = CString::new("RetainCountClass").unwrap();
+        unsafe {
+            let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
+            objc_registerClassPair(cls);
+            let mut obj = ObjcObject { isa: NonNull::new(cls).unwrap() };
+            let id: Id = Some(NonNull::from(&mut obj));
+
+            // Fresh object has implicit count of 1.
+            assert_eq!(retain_release::objc_retain_count(id), 1);
+
+            objc_retain(id);
+            assert_eq!(retain_release::objc_retain_count(id), 2);
+
+            objc_release(id);
+            assert_eq!(retain_release::objc_retain_count(id), 1);
+
+            // Release to zero — object is "deallocated" (side table cleaned up).
+            // (Memory is not freed since we allocated on the stack.)
+            objc_release(id);
+            // Count is gone from table; accessing it again is UB in real code,
+            // but for our stack-allocated test object it's safe.
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: dealloc method called on release-to-zero
+
+    static DEALLOC_CALLED: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn dealloc_impl(_obj: Id, _sel: SEL) -> Id {
+        DEALLOC_CALLED.store(true, Ordering::SeqCst);
+        None
+    }
+
+    #[test]
+    fn release_to_zero_calls_dealloc() {
+        let class_name = CString::new("DeallocClass").unwrap();
+        let sel_name = CString::new("dealloc").unwrap();
+
+        unsafe {
+            let dealloc_sel = sel_registerName(sel_name.as_ptr());
+            let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
+            let imp: IMP = std::mem::transmute(dealloc_impl as unsafe extern "C" fn(Id, SEL) -> Id);
+            class_addMethod(cls, dealloc_sel, imp, std::ptr::null());
+            objc_registerClassPair(cls);
+
+            let mut obj = ObjcObject { isa: NonNull::new(cls).unwrap() };
+            let id: Id = Some(NonNull::from(&mut obj));
+
+            objc_release(id);
+            assert!(DEALLOC_CALLED.load(Ordering::SeqCst), "-dealloc must be called on release-to-zero");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: autorelease pool
+
+    static AUTORELEASE_RELEASED: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn autorelease_dealloc_impl(_obj: Id, _sel: SEL) -> Id {
+        AUTORELEASE_RELEASED.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+
+    #[test]
+    fn autorelease_pool_releases_on_pop() {
+        let class_name = CString::new("AutoreleaseClass").unwrap();
+        let sel_name = CString::new("autoreleaseDealloc").unwrap();
+
+        unsafe {
+            let dealloc_sel = sel_registerName(CString::new("dealloc").unwrap().as_ptr());
+            let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
+            let imp: IMP = std::mem::transmute(
+                autorelease_dealloc_impl as unsafe extern "C" fn(Id, SEL) -> Id,
+            );
+            class_addMethod(cls, dealloc_sel, imp, std::ptr::null());
+            objc_registerClassPair(cls);
+            drop(sel_name);
+
+            let mut obj1 = ObjcObject { isa: NonNull::new(cls).unwrap() };
+            let mut obj2 = ObjcObject { isa: NonNull::new(cls).unwrap() };
+
+            let token = objc_autoreleasePoolPush();
+            objc_autorelease(Some(NonNull::from(&mut obj1)));
+            objc_autorelease(Some(NonNull::from(&mut obj2)));
+
+            assert_eq!(AUTORELEASE_RELEASED.load(Ordering::SeqCst), 0, "no releases before pop");
+            objc_autoreleasePoolPop(token);
+            assert_eq!(AUTORELEASE_RELEASED.load(Ordering::SeqCst), 2, "both objects released on pop");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: weak references zeroed on dealloc
+
+    #[test]
+    fn weak_reference_zeroed_on_dealloc() {
+        let class_name = CString::new("WeakTestClass").unwrap();
+        unsafe {
+            let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
+            objc_registerClassPair(cls);
+
+            let mut obj = ObjcObject { isa: NonNull::new(cls).unwrap() };
+            let id: Id = Some(NonNull::from(&mut obj));
+
+            let mut weak_slot: Id = None;
+            let weak_slot_ptr = NonNull::from(&mut weak_slot);
+            objc_initWeak(weak_slot_ptr, id);
+
+            // Load inside a pool so the autoreleased retain is balanced before
+            // we call the final release.
+            let token = objc_autoreleasePoolPush();
+            assert_eq!(objc_loadWeak(weak_slot_ptr), id, "weak ref must point to live object");
+            objc_autoreleasePoolPop(token);
+
+            // Release to zero → dealloc → weak slot zeroed.
+            objc_release(id);
+            assert!(objc_loadWeak(weak_slot_ptr).is_none(), "weak ref must be nil after dealloc");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 2: post-registration class_addMethod
 
     static POST_REG_CALLED: AtomicBool = AtomicBool::new(false);
@@ -524,7 +754,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id = &mut obj as Id;
+            let id: Id = Some(NonNull::from(&mut obj));
             assert!(
                 objc_msg_lookup(id, sel).is_none(),
                 "method must not exist before post-registration add"

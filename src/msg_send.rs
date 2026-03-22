@@ -46,6 +46,10 @@ pub unsafe fn class_lookup_method(cls: Option<NonNull<ObjcClass>>, sel: SEL) -> 
 
 /// Core message lookup: given a receiver and selector, return the `IMP` to call.
 ///
+/// **Fast path**: checks the per-class `MethodCache` first (one read-lock
+/// acquisition + hash lookup). On a miss the slow path walks the class
+/// hierarchy, then fills the cache before returning.
+///
 /// Returns `None` if `receiver` is null or the method is not found anywhere
 /// in the class hierarchy. (Dynamic resolution and forwarding are Phase 4.)
 ///
@@ -56,7 +60,28 @@ pub unsafe fn objc_msg_lookup(receiver: Id, sel: SEL) -> Option<IMP> {
     // SAFETY: caller guarantees `receiver` is non-null and points to a live ObjcObject;
     // NonNull::new above confirmed non-null, so dereferencing is valid.
     let cls = unsafe { receiver.as_ref().isa };
-    // SAFETY: `cls` came from a live ObjcObject's `isa` field, which is always set to a
-    // valid ObjcClass by `objc_allocate_class_pair` and never mutated after construction.
-    unsafe { class_lookup_method(Some(cls), sel) }
+
+    // --- Fast path: check the per-class cache ---
+    // SAFETY: `cls` came from a live ObjcObject's `isa`, which is always set to a
+    // valid ObjcClass. The `cache` field is set in `objc_allocate_class_pair` and
+    // never mutated after construction.
+    let cache = unsafe { cls.as_ref().cache };
+    if let Some(cache) = cache {
+        // SAFETY: cache was allocated by `MethodCache::new` in `objc_allocate_class_pair`.
+        if let Some(imp) = unsafe { cache.as_ref().lookup(sel) } {
+            return Some(imp);
+        }
+    }
+
+    // --- Slow path: walk the hierarchy ---
+    // SAFETY: `cls` is always a valid ObjcClass (see above).
+    let imp = unsafe { class_lookup_method(Some(cls), sel) }?;
+
+    // Fill the cache so the next call takes the fast path.
+    if let Some(cache) = cache {
+        // SAFETY: same as above.
+        unsafe { cache.as_ref().insert(sel, imp) };
+    }
+
+    Some(imp)
 }

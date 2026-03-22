@@ -1,0 +1,19 @@
+language = "C"
+include_version = true
+# Forward-declare the opaque class type so that ObjcObject.isa compiles.
+# ObjcClass itself is excluded from export (its layout is not public API).
+after_includes = "typedef struct objc_class objc_class;"
+
+[export]
+# Export the public ABI types. ObjcClass and ObjcClassAbi are excluded:
+# struct objc_class is opaque in the GNUstep public header and our internal
+# layout is not part of the public interface.
+include = ["ObjcObject", "ObjcSelector", "MethodEntry", "MethodList"]
+exclude = ["ObjcClass", "ObjcClassAbi"]
+
+[export.rename]
+"ObjcObject" = "objc_object"
+"ObjcSelector" = "objc_selector"
+"MethodEntry" = "objc_method"
+"MethodList" = "objc_method_list"
+"ObjcClass" = "objc_class"

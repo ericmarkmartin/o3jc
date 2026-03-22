@@ -1,16 +1,20 @@
 //! **o3jc** — an Objective-C runtime implemented in Rust.
 //!
-//! Phase 1: core type system, selector interning, class registry, and
-//! slow-path method dispatch (no cache, no forwarding).
+//! Phase 2 adds: per-class method cache (fast dispatch path),
+//! post-registration `class_addMethod`, and `method_exchangeImplementations`.
 
 pub mod class_registry;
+pub mod method_cache;
 pub mod msg_send;
 pub mod sel;
 pub mod types;
 
 pub use class_registry::{
-    class_add_method, objc_allocate_class_pair, objc_get_class_str, objc_register_class_pair,
+    class_add_method, class_get_instance_method, class_replace_method,
+    method_exchange_implementations, objc_allocate_class_pair, objc_get_class_str,
+    objc_register_class_pair,
 };
+pub use method_cache::MethodCache;
 pub use msg_send::class_lookup_method;
 pub use sel::{sel_get_name, sel_register_name_str};
 pub use types::*;
@@ -90,10 +94,61 @@ pub unsafe extern "C" fn class_addMethod(
     imp: IMP,
     types: *const std::ffi::c_char,
 ) -> bool {
-    // SAFETY: caller (C code) guarantees `cls` is a valid non-null ObjcClass, `sel` is
-    // an interned selector, `imp` is a valid function pointer, and `types` is null or a
-    // valid null-terminated type-encoding string.
+    // SAFETY: forwarding caller's guarantees.
     unsafe { class_registry::class_add_method(cls, sel, imp, types) }
+}
+
+/// Replace a method's implementation, or add it if absent.
+///
+/// Returns the previous IMP (as a nullable function pointer at the C ABI level),
+/// or null if the method did not previously exist.
+///
+/// # Safety
+/// Same requirements as `class_addMethod`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn class_replaceMethod(
+    cls: Class,
+    sel: SEL,
+    imp: IMP,
+    types: *const std::ffi::c_char,
+) -> Option<IMP> {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { class_registry::class_replace_method(cls, sel, imp, types) }
+}
+
+/// Return the `Method` (a pointer to the `MethodEntry`) for `sel` in `cls`.
+///
+/// Only searches `cls` itself, not its superclasses. Returns null if not found.
+///
+/// # Safety
+/// `cls` must be null or point to a live `ObjcClass`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn class_getInstanceMethod(cls: Class, sel: SEL) -> *mut MethodEntry {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { class_registry::class_get_instance_method(cls, sel) }
+}
+
+/// Return the IMP stored in a `Method`.
+///
+/// # Safety
+/// `method` must be non-null and point to a live `MethodEntry`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn method_getImplementation(method: *mut MethodEntry) -> IMP {
+    // SAFETY: caller guarantees `method` is non-null and valid.
+    unsafe { (*method).imp }
+}
+
+/// Atomically swap the implementations of two methods and flush all caches.
+///
+/// # Safety
+/// Both `m1` and `m2` must be non-null pointers to live `MethodEntry` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn method_exchangeImplementations(
+    m1: *mut MethodEntry,
+    m2: *mut MethodEntry,
+) {
+    // SAFETY: forwarding caller's guarantees.
+    unsafe { class_registry::method_exchange_implementations(m1, m2) }
 }
 
 /// GNUstep-style IMP lookup.
@@ -120,7 +175,7 @@ pub unsafe extern "C" fn objc_msg_lookup(receiver: Id, sel: SEL) -> Option<IMP> 
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use std::ptr::NonNull;
 
@@ -136,7 +191,6 @@ mod tests {
         unsafe {
             let s1 = sel_registerName(n1.as_ptr());
             let s2 = sel_registerName(n2.as_ptr());
-            assert!(!s1.is_null());
             assert_eq!(s1, s2, "identical names must intern to the same pointer");
         }
     }
@@ -337,6 +391,156 @@ mod tests {
                 !OVERRIDE_PARENT_CALLED.load(Ordering::SeqCst),
                 "parent impl must not be called when child overrides"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: cache hit after first dispatch
+
+    static CACHE_IMPL_CALLED: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn cache_impl() {
+        CACHE_IMPL_CALLED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn cache_hit_after_first_dispatch() {
+        let class_name = CString::new("CacheTestClass").unwrap();
+        let sel_name = CString::new("cachedMethod").unwrap();
+        let type_enc = CString::new("v16@0:8").unwrap();
+
+        unsafe {
+            let sel = sel_registerName(sel_name.as_ptr());
+            let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
+            let imp: IMP = std::mem::transmute(cache_impl as unsafe extern "C" fn());
+            class_addMethod(cls, sel, imp, type_enc.as_ptr());
+            objc_registerClassPair(cls);
+
+            let mut obj = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
+            let id = &mut obj as Id;
+
+            // First lookup: slow path, fills cache.
+            let found1 = objc_msg_lookup(id, sel);
+            assert!(found1.is_some());
+
+            // Second lookup: should hit the cache and return the same IMP.
+            let found2 = objc_msg_lookup(id, sel);
+            assert_eq!(
+                found1.unwrap() as usize,
+                found2.unwrap() as usize,
+                "cached and uncached lookups must return the same IMP"
+            );
+
+            // Call it to verify it works.
+            let f: unsafe extern "C" fn() = std::mem::transmute(found2.unwrap());
+            f();
+            assert_eq!(CACHE_IMPL_CALLED.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: method_exchangeImplementations (swizzling)
+
+    static SWIZZLE_A_CALLED: AtomicBool = AtomicBool::new(false);
+    static SWIZZLE_B_CALLED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn swizzle_a() {
+        SWIZZLE_A_CALLED.store(true, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn swizzle_b() {
+        SWIZZLE_B_CALLED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn method_swizzle_works() {
+        let class_name = CString::new("SwizzleClass").unwrap();
+        let sel_a_name = CString::new("swizzleA").unwrap();
+        let sel_b_name = CString::new("swizzleB").unwrap();
+        let type_enc = CString::new("v16@0:8").unwrap();
+
+        unsafe {
+            let sel_a = sel_registerName(sel_a_name.as_ptr());
+            let sel_b = sel_registerName(sel_b_name.as_ptr());
+            let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
+
+            let imp_a: IMP = std::mem::transmute(swizzle_a as unsafe extern "C" fn());
+            let imp_b: IMP = std::mem::transmute(swizzle_b as unsafe extern "C" fn());
+            class_addMethod(cls, sel_a, imp_a, type_enc.as_ptr());
+            class_addMethod(cls, sel_b, imp_b, type_enc.as_ptr());
+            objc_registerClassPair(cls);
+
+            let mut obj = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
+            let id = &mut obj as Id;
+
+            // Warm the cache for sel_a.
+            let _ = objc_msg_lookup(id, sel_a);
+
+            // Swap A ↔ B.
+            let m_a = class_getInstanceMethod(cls, sel_a);
+            let m_b = class_getInstanceMethod(cls, sel_b);
+            assert!(!m_a.is_null() && !m_b.is_null());
+            method_exchangeImplementations(m_a, m_b);
+
+            // After swizzle, looking up sel_a should return imp_b (which calls swizzle_b).
+            let found = objc_msg_lookup(id, sel_a);
+            assert!(found.is_some());
+            let f: unsafe extern "C" fn() = std::mem::transmute(found.unwrap());
+            f();
+
+            assert!(
+                SWIZZLE_B_CALLED.load(Ordering::SeqCst),
+                "swizzle_b must be called via sel_a after exchange"
+            );
+            assert!(
+                !SWIZZLE_A_CALLED.load(Ordering::SeqCst),
+                "swizzle_a must not be called via sel_a after exchange"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: post-registration class_addMethod
+
+    static POST_REG_CALLED: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn post_reg_impl() {
+        POST_REG_CALLED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn post_registration_add_method() {
+        let class_name = CString::new("PostRegClass").unwrap();
+        let sel_name = CString::new("postRegMethod").unwrap();
+        let type_enc = CString::new("v16@0:8").unwrap();
+
+        unsafe {
+            let sel = sel_registerName(sel_name.as_ptr());
+            let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
+            objc_registerClassPair(cls);
+
+            // Method does not exist yet.
+            let mut obj = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
+            let id = &mut obj as Id;
+            assert!(
+                objc_msg_lookup(id, sel).is_none(),
+                "method must not exist before post-registration add"
+            );
+
+            // Add post-registration.
+            let imp: IMP = std::mem::transmute(post_reg_impl as unsafe extern "C" fn());
+            let added = class_addMethod(cls, sel, imp, type_enc.as_ptr());
+            assert!(added, "post-registration add must return true");
+
+            // Now dispatch must find it.
+            let found = objc_msg_lookup(id, sel);
+            assert!(found.is_some(), "method must be found after post-registration add");
+            let f: unsafe extern "C" fn() = std::mem::transmute(found.unwrap());
+            f();
+            assert!(POST_REG_CALLED.load(Ordering::SeqCst));
         }
     }
 }

@@ -59,18 +59,68 @@ libc = "0.2"
 
 ---
 
-## Phase 2 — Not started
+## Phase 2 ✅ — Complete
 
-**Scope:** Method cache + `class_addMethod` (runtime) + `method_exchangeImplementations`
+**Milestone:** Hot dispatch path; method swizzling works
 
-**Planned files:** `src/method_cache.rs`
+### What was built
 
-**Key work:**
-- Per-class power-of-two bucket array: hash = `(sel as usize >> 2) & mask`
-- Fill cache on slow-path hit; invalidate on swizzle / category attach
-- Cache invalidation propagates through `first_subclass` / `next_sibling` tree (needs those pointers added to `ObjcClass`)
-- `method_exchangeImplementations`: atomic IMP swap + cache flush
-- Replace `Vec<MethodEntry>` in `MethodList` with a count + inline array to match the GNUstep v2 ABI layout (`struct objc_method_list` uses a flexible array member); add `#[repr(C)]` to `MethodList` at the same time
+| File | Description |
+|---|---|
+| `src/method_cache.rs` | `MethodCache`: dense `Vec<CacheEntry>` pre-allocated to 16 entries, flushed (not grown) when full. `parking_lot::RwLock<CacheInner>` for thread safety. `flush_class_cache_tree` walks `first_subclass` / `next_sibling` to propagate invalidation. |
+| `src/types.rs` | `ObjcClass` flattened to single struct with all fields inline. `SEL` changed to `NonNull<ObjcSelector>` (zero-size opaque `#[repr(C)]` struct). `IMP` corrected to `unsafe extern "C" fn(Id, SEL, ...) -> Id`. `cache` field is `Option<NonNull<MethodCache>>`. |
+| `src/class_registry.rs` | `objc_allocate_class_pair` allocates a `MethodCache` per class+metaclass and wires `first_subclass` / `next_sibling`. `class_add_method` prepends a new `MethodList` node (and flushes the cache tree) when called post-registration. New functions: `class_get_instance_method`, `class_replace_method`, `method_exchange_implementations`, `flush_all_caches`. |
+| `src/msg_send.rs` | `objc_msg_lookup` checks cache first; fills on slow-path hit. |
+| `src/lib.rs` | New C ABI exports; 3 additional tests (10 total). |
+| `build.rs` + `cbindgen.toml` + `include/o3jc.h` | cbindgen generates a C header from exported Rust types for comparison against GNUstep's `runtime.h`. Exported struct names match GNUstep (`objc_object`, `objc_selector`, `objc_method`, etc.). `struct objc_class` is forward-declared opaque. |
+| `third_party/libobjc2/` | Vendored GNUstep public headers for reference. |
+
+### C ABI exports (new in Phase 2)
+
+```c
+Method   class_getInstanceMethod(Class cls, SEL sel);
+IMP      method_getImplementation(Method m);
+void     method_exchangeImplementations(Method m1, Method m2);
+IMP      class_replaceMethod(Class cls, SEL sel, IMP imp, const char *types);
+```
+
+### Tests passing (10/10)
+
+All Phase 1 tests continue to pass, plus:
+
+- `cache_hit_after_first_dispatch` — second lookup returns same IMP (from cache)
+- `method_swizzle_works` — after `method_exchangeImplementations`, sel_a dispatches to imp_b
+- `post_registration_add_method` — `class_addMethod` after `objc_registerClassPair` works and is discoverable by `objc_msg_lookup`
+
+### Key implementation notes
+
+- **Cache design**: `Vec<CacheEntry>` pre-allocated with `with_capacity(16)`. On full, entries are cleared rather than grown — same strategy as Apple's runtime. No sentinels or hash table needed at this scale.
+- **Cache field type**: `Option<NonNull<MethodCache>>` — null-pointer niche means same size as a raw pointer; pattern-matches cleanly at call sites.
+- **Thread safety of cache**: `parking_lot::RwLock` guards the inner table. Read lock for lookups (fast path), write lock for insert/flush.
+- **Post-registration method add**: prepends a new single-entry `MethodList` node to the chain rather than mutating the existing `Vec`. This keeps all previously-returned `*mut MethodEntry` pointers stable.
+- **Swizzle cache flush**: `method_exchange_implementations` calls `flush_all_caches` (walks every registered class) because `MethodEntry` has no back-pointer to its owning class. Swizzling is rare so the global flush is acceptable.
+- **`ObjcSelector` opaque type**: `SEL = NonNull<ObjcSelector>` where `ObjcSelector` is a zero-size `#[repr(C)]` struct, matching GNUstep's `const struct objc_selector *`. The SEL pointer value is actually the address of an interned `CString`; `sel_get_name` recovers it by casting back to `*const c_char`.
+- **`ObjcClassAbi` split explored and collapsed**: We briefly split `ObjcClass` into an ABI-visible `ObjcClassAbi` prefix and a runtime-internal tail. Determined `struct objc_class` is fully opaque in the GNUstep public header — the compiler never accesses fields by name through it — so the split doesn't reflect a real boundary yet. Collapsed back to a single flat struct. The split will return when we implement loading of Clang-compiled binaries.
+
+### GNUstep v2 static class layout (researched, not yet implemented)
+
+When Clang compiles `@implementation`, it emits a 17-field class struct (from `CGObjCGNU.cpp`). Our current `ObjcClass` covers most fields but is missing and has deviations that must be fixed before loading Clang-compiled binaries:
+
+**Missing fields:**
+
+| Field # | Name | Type |
+|---|---|---|
+| 9 | `cxx_construct` | `IMP` |
+| 10 | `cxx_destruct` | `IMP` |
+| 14 | `extra_data` | `*reference_list` |
+| 15 | `abi_version` | `long` |
+| 16 | `properties` | `*objc_property_list` |
+
+**Other deviations:**
+- Clang emits `instance_size` as a **negative** value; the runtime patches it at load time.
+- `cache` has no ABI slot — it must follow all 17 ABI fields, not sit in the middle.
+- Method entry layout is wrong for v2: Clang emits `{IMP, *selector_struct, *types}` (IMP first); we have `{SEL, *const c_char, IMP}`.
+- The selector in compiled method lists is a pointer to a `{name, types}` struct in `__objc_selectors`, not our interned opaque pointer. The runtime must process `__objc_selectors` at load time to intern and patch these.
 
 ---
 

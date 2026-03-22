@@ -12,16 +12,33 @@ pub struct ObjcObject {
 unsafe impl Send for ObjcObject {}
 unsafe impl Sync for ObjcObject {}
 
-/// A method implementation. Callers must cast to the actual signature before
-/// invoking; the declared type matches the C ABI "opaque function pointer".
-pub type IMP = unsafe extern "C" fn();
+/// Opaque selector handle — corresponds to GNUstep's `struct objc_selector`.
+///
+/// cbindgen:opaque
+///
+/// Never constructed directly; exists only as a pointee for `SEL`. The
+/// concrete representation (an interned C string address) is a runtime
+/// implementation detail invisible to Clang-compiled code.
+#[repr(C)]
+pub struct ObjcSelector {
+    _private: [u8; 0],
+}
 
-/// A selector — an interned `*const c_char`. Two selectors are equal iff their
-/// pointer values are equal (guaranteed by the intern table in `sel.rs`).
-pub type SEL = *const c_char;
+/// A selector — a non-null pointer to an interned `ObjcSelector`.
+///
+/// Two selectors are equal iff their pointer values are equal (guaranteed by
+/// the intern table in `sel.rs`). Nullable selectors at call boundaries are
+/// expressed as `Option<SEL>`.
+pub type SEL = NonNull<ObjcSelector>;
 
 /// An opaque object reference (`id` in Objective-C).
 pub type Id = *mut ObjcObject;
+
+/// A method implementation.
+///
+/// Matches the GNUstep ABI signature `id (*IMP)(id, SEL, ...)`. Callers must
+/// transmute to the actual parameter types before invoking.
+pub type IMP = unsafe extern "C" fn(Id, SEL, ...) -> Id;
 
 /// A class pointer (`Class` in Objective-C).
 pub type Class = *mut ObjcClass;
@@ -43,6 +60,7 @@ unsafe impl Sync for MethodEntry {}
 ///
 /// The `next` pointer lets categories prepend lists without copying.
 /// Phase 1: one list per class; category chaining added in Phase 5.
+#[repr(C)]
 pub struct MethodList {
     /// Next list in the chain (`None` = end of chain).
     pub next: Option<NonNull<MethodList>>,
@@ -72,14 +90,16 @@ pub mod class_flags {
     pub const CLASS_IS_METACLASS: u64 = 1 << 1;
 }
 
-/// The Objective-C class structure (broadly GNUstep v2 ABI-compatible).
+/// The runtime class object.
 ///
-/// `#[repr(C)]` ensures `isa` is at offset 0, so an `*mut ObjcClass` can
-/// safely be cast to `*mut ObjcObject`.
+/// The field layout here will eventually need to match what Clang emits for
+/// compiler-generated static classes (e.g. `@implementation MyClass`), but we
+/// haven't yet pinned down the exact GNUstep v2 layout. For now this is
+/// whatever the runtime needs internally.
 #[repr(C)]
 pub struct ObjcClass {
-    /// The metaclass (isa of the class object). `None` only for the root
-    /// metaclass, which is set during bootstrap (Phase 1: left null).
+    /// The metaclass (`isa` of the class object). `None` only for the root
+    /// metaclass (set during bootstrap).
     pub isa: Option<NonNull<ObjcClass>>,
     /// The superclass; `None` for the root class.
     pub super_class: Option<NonNull<ObjcClass>>,
@@ -91,15 +111,21 @@ pub struct ObjcClass {
     pub info: u64,
     /// Size of an instance in bytes.
     pub instance_size: i64,
-    /// Ivar list — null in Phase 1.
+    /// Ivar list — null until Phase 6.
     pub ivars: *const (),
-    /// Head of the method list chain for this class. `None` if no methods have
-    /// been added yet; lazily initialized by `class_add_method`.
+    /// Head of the method list chain. `None` if no methods have been added yet.
     pub method_list: Option<NonNull<MethodList>>,
-    /// Method cache / dispatch table — null in Phase 1.
+    /// GNUstep dispatch table pointer. Null until we implement the dtable mechanism.
     pub dtable: *const (),
-    /// Protocol list — null in Phase 1.
+    /// Protocol list — null until Phase 5.
     pub protocols: *const (),
+    /// Head of the direct-subclass linked list, threaded through `next_sibling`.
+    /// Used to propagate cache invalidation down the hierarchy.
+    pub first_subclass: Option<NonNull<ObjcClass>>,
+    /// Next sibling in the parent's subclass list (`None` = end of list).
+    pub next_sibling: Option<NonNull<ObjcClass>>,
+    /// Per-class method cache. `None` until `objc_allocate_class_pair` initialises it.
+    pub cache: Option<NonNull<crate::method_cache::MethodCache>>,
 }
 
 // SAFETY: The runtime owns all synchronization for class objects.

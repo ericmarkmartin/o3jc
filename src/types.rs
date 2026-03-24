@@ -33,15 +33,44 @@ pub struct ObjcSelector {
 /// expressed as `Option<SEL>`.
 pub type SEL = NonNull<ObjcSelector>;
 
+/// A non-null, `Send + Sync` pointer to an `ObjcObject`.
+///
+/// Needed because `NonNull<T>` is unconditionally `!Send + !Sync`, but
+/// `ShardedMutex<Id>` requires `Id: Send` for its `Sync` impl.
+/// `#[repr(transparent)]` preserves the niche so `Option<ObjcPtr>` is
+/// ABI-compatible with a nullable `*mut ObjcObject`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct ObjcPtr(NonNull<ObjcObject>);
+
+impl Clone for ObjcPtr {
+    fn clone(&self) -> Self { *self }
+}
+impl Copy for ObjcPtr {}
+
+impl std::ops::Deref for ObjcPtr {
+    type Target = NonNull<ObjcObject>;
+    fn deref(&self) -> &NonNull<ObjcObject> { &self.0 }
+}
+
+impl From<NonNull<ObjcObject>> for ObjcPtr {
+    fn from(ptr: NonNull<ObjcObject>) -> Self { Self(ptr) }
+}
+
+// SAFETY: The runtime serializes all access to ObjC objects through
+// side-table locks and stripe locks.
+unsafe impl Send for ObjcPtr {}
+unsafe impl Sync for ObjcPtr {}
+
 /// An opaque object reference (`id` in Objective-C).
 ///
-/// `None` is the equivalent of Objective-C `nil`. `SendPtr` is
-/// `#[repr(transparent)]` around `NonNull`, so `Option<SendPtr<T>>` has the
-/// same null-pointer niche optimization and is ABI-compatible with `*mut T`.
+/// `None` is the equivalent of Objective-C `nil`. `ObjcPtr` is
+/// `#[repr(transparent)]` around `NonNull<ObjcObject>`, so `Option<ObjcPtr>`
+/// has the null-pointer niche and is ABI-compatible with `*mut ObjcObject`.
 ///
-/// Using `SendPtr` (rather than bare `NonNull`) makes `Id` `Send + Sync`,
-/// which propagates through `ShardedMutex<Id>`, `DashMap`, etc.
-pub type Id = Option<crate::send_ptr::SendPtr<ObjcObject>>;
+/// cbindgen can't resolve custom `#[repr(transparent)]` wrappers inside
+/// `Option`, so the C header defines `Id` manually via `cbindgen.toml`.
+pub type Id = Option<ObjcPtr>;
 
 /// A method implementation.
 ///

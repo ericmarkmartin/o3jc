@@ -1,15 +1,21 @@
 language = "C"
 include_version = true
-# Forward-declare the opaque class type so that ObjcObject.isa compiles.
-# ObjcClass itself is excluded from export (its layout is not public API).
-after_includes = "typedef struct objc_class objc_class;"
+# Forward-declare opaque types and manually define `Id`.
+#
+# cbindgen's `Option<NonNull<T>>` → pointer resolution is special-cased for
+# `NonNull` itself and can't see through our `ObjcPtr` wrapper (needed for
+# `Send + Sync`).  We suppress the opaque struct and provide the correct typedef.
+after_includes = """
+typedef struct objc_class objc_class;
+typedef struct objc_object *Id;
+"""
 
 [export]
 # Export the public ABI types. ObjcClass and ObjcClassAbi are excluded:
 # struct objc_class is opaque in the GNUstep public header and our internal
 # layout is not part of the public interface.
 include = ["ObjcObject", "ObjcSelector", "MethodEntry", "MethodList"]
-exclude = ["ObjcClass", "ObjcClassAbi"]
+exclude = ["ObjcClass", "ObjcClassAbi", "ObjcPtr", "Option_ObjcPtr", "Id"]
 
 [export.rename]
 "ObjcObject" = "objc_object"

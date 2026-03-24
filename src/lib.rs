@@ -9,7 +9,6 @@ pub mod method_cache;
 pub mod msg_send;
 pub mod retain_release;
 pub mod sel;
-mod send_ptr;
 pub mod types;
 
 use std::ptr::NonNull;
@@ -288,7 +287,6 @@ mod tests {
     use std::ptr::NonNull;
 
     use super::*;
-    use crate::send_ptr::SendPtr;
 
     // -----------------------------------------------------------------------
     // Selector interning
@@ -373,7 +371,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             let found = objc_msg_lookup(id, sel);
             assert!(found.is_some(), "IMP must be found for registered method");
@@ -417,7 +415,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(child).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             let found = objc_msg_lookup(id, sel);
             assert!(
@@ -483,7 +481,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(child).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             let found = objc_msg_lookup(id, sel);
             assert!(found.is_some());
@@ -527,7 +525,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             // First lookup: slow path, fills cache.
             let found1 = objc_msg_lookup(id, sel);
@@ -582,7 +580,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             // Warm the cache for sel_a.
             let _ = objc_msg_lookup(id, sel_a);
@@ -622,7 +620,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             // Fresh object has implicit count of 1.
             assert_eq!(retain_release::objc_retain_count(id), 1);
@@ -665,7 +663,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             objc_release(id);
             assert!(
@@ -707,8 +705,8 @@ mod tests {
             };
 
             let token = objc_autoreleasePoolPush();
-            objc_autorelease(Some(SendPtr::from(NonNull::from(&mut obj1))));
-            objc_autorelease(Some(SendPtr::from(NonNull::from(&mut obj2))));
+            objc_autorelease(Some(ObjcPtr::from(NonNull::from(&mut obj1))));
+            objc_autorelease(Some(ObjcPtr::from(NonNull::from(&mut obj2))));
 
             assert_eq!(
                 AUTORELEASE_RELEASED.load(Ordering::SeqCst),
@@ -737,7 +735,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
 
             let mut weak_slot: Id = None;
             let weak_slot_ptr = NonNull::from(&mut weak_slot);
@@ -785,7 +783,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
+            let id: Id = Some(ObjcPtr::from(NonNull::from(&mut obj)));
             assert!(
                 objc_msg_lookup(id, sel).is_none(),
                 "method must not exist before post-registration add"

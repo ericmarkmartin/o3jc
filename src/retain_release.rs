@@ -32,11 +32,9 @@ use smallvec::SmallVec;
 use std::ptr::NonNull;
 use std::sync::LazyLock;
 
-use crate::ObjcObject;
 use crate::autorelease::objc_autorelease;
 use crate::msg_send::objc_msg_lookup;
 use crate::sel::sel_register_name_str;
-use crate::send_ptr::SendPtr;
 use crate::types::Id;
 
 // ---------------------------------------------------------------------------
@@ -110,12 +108,10 @@ struct SideTableEntry {
     weak_locations: SmallVec<[WeakSlot; 0]>,
 }
 
-// `WeakSlot` is `Send + Sync` via its `&'static ShardedMutex` field, but the
-// auto-trait checker can't see through the `DashMap` to verify.  The entry
-// as a whole is safe: `usize`, `bool`, and `SmallVec<[WeakSlot]>` are all
-// `Send + Sync`.
-
-static TABLE: LazyLock<DashMap<SendPtr<ObjcObject>, SideTableEntry>> = LazyLock::new(DashMap::new);
+// Keyed by object address cast to `usize` — this makes the pointer inert
+// (no `Send`/`Sync` issues) and avoids a custom wrapper type.  The address
+// is only used for identity; the pointer is never dereferenced through the key.
+static TABLE: LazyLock<DashMap<usize, SideTableEntry>> = LazyLock::new(DashMap::new);
 
 // ---------------------------------------------------------------------------
 // Retain / release
@@ -128,7 +124,7 @@ static TABLE: LazyLock<DashMap<SendPtr<ObjcObject>, SideTableEntry>> = LazyLock:
 /// `obj` must be `None` or point to a live `ObjcObject`.
 pub unsafe fn objc_retain(obj: Id) -> Id {
     let obj = obj?;
-    let mut entry = TABLE.entry(obj).or_insert(SideTableEntry {
+    let mut entry = TABLE.entry(obj.as_ptr() as usize).or_insert(SideTableEntry {
         retain_count: 1,
         deallocating: false,
         weak_locations: SmallVec::new(),
@@ -146,7 +142,7 @@ pub unsafe fn objc_retain(obj: Id) -> Id {
 /// `obj` must be `None` or point to a live `ObjcObject`.
 pub unsafe fn objc_release(obj: Id) {
     let Some(obj) = obj else { return };
-    let key = obj;
+    let key = obj.as_ptr() as usize;
 
     let weak_locations = match TABLE.entry(key) {
         dashmap::mapref::entry::Entry::Vacant(_) => {
@@ -184,7 +180,7 @@ pub unsafe fn objc_release(obj: Id) {
 /// Return the current retain count of `obj` (primarily for debugging).
 pub fn objc_retain_count(obj: Id) -> usize {
     let Some(obj) = obj else { return 0 };
-    TABLE.get(&(obj)).map_or(1, |e| e.retain_count)
+    TABLE.get(&(obj.as_ptr() as usize)).map_or(1, |e| e.retain_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,14 +244,14 @@ pub unsafe fn objc_store_weak(location: NonNull<Id>, new_obj: Id) -> Id {
 
     let old_obj = *guard;
     if let Some(old_obj) = old_obj
-        && let Some(mut entry) = TABLE.get_mut(&old_obj)
+        && let Some(mut entry) = TABLE.get_mut(&(old_obj.as_ptr() as usize))
     {
         let loc = location.as_ptr() as *const Id;
         entry.weak_locations.retain(|w| w.addr() != loc);
     }
 
     if let Some(new_obj) = new_obj {
-        let mut entry = TABLE.entry(new_obj).or_insert(SideTableEntry {
+        let mut entry = TABLE.entry(new_obj.as_ptr() as usize).or_insert(SideTableEntry {
             retain_count: 1,
             deallocating: false,
             weak_locations: SmallVec::new(),
@@ -324,7 +320,7 @@ pub unsafe fn objc_destroy_weak(location: NonNull<Id>) {
 
     let obj = *guard;
     if let Some(obj) = obj
-        && let Some(mut entry) = TABLE.get_mut(&(obj))
+        && let Some(mut entry) = TABLE.get_mut(&(obj.as_ptr() as usize))
     {
         let loc = location.as_ptr() as *const Id;
         entry.weak_locations.retain(|w| w.addr() != loc);

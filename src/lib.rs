@@ -4,6 +4,7 @@
 
 pub mod autorelease;
 pub mod class_registry;
+pub mod loader;
 pub mod method_cache;
 pub mod msg_send;
 pub mod retain_release;

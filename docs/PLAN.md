@@ -94,16 +94,32 @@ Build a GNUstep v2 ABI-compatible Objective-C runtime in Rust. Primary purpose i
 
 ## Phased Implementation
 
-| Phase | Scope | Milestone |
+Phases are now organized around binary-linking milestones — each phase targets the
+most minimal possible Clang-compiled `.m` file, then expands. Phases 1–3 are
+complete (pure-Rust runtime foundation); phases 4 onward target real binaries.
+
+### Completed
+
+| Phase | Milestone | Key work |
 |---|---|---|
-| **1** ✅ | Types + Selector + Class Registry + Slow-path msgSend | Define a class, add methods, dispatch works (no cache) |
-| **2** | Method Cache + `class_addMethod` + `method_exchangeImplementations` | Hot dispatch path; method swizzling works |
-| **3** | Retain/Release + Autorelease Pools + Weak References | Full object lifecycle; no leaks |
-| **4** | Dynamic Resolution + Message Forwarding | NSProxy-style proxies; `doesNotRecognizeSelector:` raised |
-| **5** | Categories + Protocols | Full ObjC language feature set |
-| **6** | Introspection API + Associated Objects | Complete `<objc/runtime.h>` surface |
-| **7** | Exception Handling (real `__cxa_throw` / personality) | `@try/@catch` works end-to-end |
-| **8** | Blocks Runtime | Block objects copy/release correctly |
+| **1** ✅ | Rust-only: define a class, add methods, dispatch works | Types, selector intern table, class registry, slow-path `objc_msg_lookup` |
+| **2** ✅ | Rust-only: hot dispatch path; method swizzling | Method cache, `class_addMethod` post-registration, `method_exchangeImplementations` |
+| **3** ✅ | Rust-only: full object lifecycle; no leaks | Retain/release side table, autorelease pools, weak references |
+
+### Upcoming (binary-linking milestones)
+
+| Phase | Milestone | Key work |
+|---|---|---|
+| **4** | Link and run a `.m` with **no static classes** | Build `.so`; verify symbol surface against GNUstep ABI; test harness (Makefile + minimal `.m` using only runtime APIs dynamically) |
+| **5** | Link and run a `.m` with **static classes** (no framework deps, explicit root) | Fix `ObjcClass` layout (17 fields, `cache` after ABI fields); fix `MethodEntry` layout (`IMP` first); ELF section loader (`__objc_classes`, `__objc_selectors`, `__objc_init_func`); selector fixup at load time; root class bootstrap; `instance_size` sign patch |
+| **6** | Static class **hierarchies** | Superclass chain fixup from compiled data; method resolution through compiled hierarchy; proper metaclass ISA chain |
+| **7** | **Dynamic resolution + forwarding** | `+resolveInstanceMethod:`, `-forwardingTargetForSelector:`, full forwarding pipeline, `doesNotRecognizeSelector:` |
+| **8** | **Categories** | `__objc_cats` ELF section loader; `attachCategories` at load time; cache invalidation |
+| **9** | **Protocols** | Protocol objects from `__objc_prots`; conformance checking; `@protocol` expressions |
+| **10** | **ARC return-value optimizations** | `objc_retainAutoreleasedReturnValue`, `objc_autoreleaseReturnValue`, `objc_retainAutorelease`; thread-local magic for the fast path |
+| **11** | **Introspection API + Associated Objects** | Complete `<objc/runtime.h>` surface; `objc_setAssociatedObject` / `objc_getAssociatedObject` |
+| **12** | **Exception handling** | `objc_exception_throw` → `__cxa_throw`; Itanium personality function; `@try/@catch` works end-to-end |
+| **13** | **Blocks runtime** | `Block_layout`; `_Block_copy` / `_Block_release`; stack → heap promotion |
 
 ---
 
@@ -114,23 +130,21 @@ src/
   lib.rs                  — crate root, re-exports, #[unsafe(no_mangle)] C API
   types.rs                — ObjcObject, ObjcClass, SEL, IMP, id, Class (all #[repr(C)])
   sel.rs                  — selector intern table
-  class_data.rs           — ClassRo, ClassRw, MethodList, IvarList
   class_registry.rs       — global class table, allocate/register pair
-  method_list.rs          — search (linear + binary), method_t ops
   method_cache.rs         — cache_t: bucket table, fill, flush, invalidation
-  msg_send.rs             — objc_msgSend: fast path + slow path + super
+  msg_send.rs             — objc_msg_lookup: cache fast path + slow path
+  retain_release.rs       — side table, retain, release, dealloc, weak references
+  autorelease.rs          — AutoreleasePool page stack, push/pop
+  loader.rs               — ELF section walker (__objc_classes, __objc_selectors, etc.)
+  bootstrap.rs            — root class initialization
   dynamic_resolution.rs   — resolveInstanceMethod/resolveClassMethod
   forwarding.rs           — 3-stage forwarding pipeline
-  retain_release.rs       — SideTable, retain, release, dealloc
-  autorelease.rs          — AutoreleasePool page stack, push/pop
-  weak.rs                 — WeakTable, storeWeak, loadWeak, zeroing on dealloc
   category.rs             — category_t, attachCategories
   protocol.rs             — protocol_t, global table, conformance checking
   associated_objects.rs   — AssocTable, set/get/remove, cleanup on dealloc
   introspection.rs        — all public C API
   exceptions.rs           — objc_exception_throw, personality function
   blocks.rs               — Block_layout, _Block_copy, _Block_release
-  bootstrap.rs            — root class initialization
 ```
 
 ---
@@ -154,7 +168,14 @@ src/
 
 ## Verification
 
-Each phase can be verified by writing a minimal Clang ObjC test file (`.m`), compiling with `-fobjc-runtime=gnustep-2.0`, linking against the Rust-built runtime, and running it.
+Each phase from 4 onward is verified by a Clang-compiled `.m` file. Compile with:
+
+```
+clang -fobjc-runtime=gnustep-2.0 -fobjc-arc foo.m -L. -lo3jc -o foo
+```
+
+The test `.m` for each phase is the simplest possible file that exercises that
+phase's new capability. Earlier phases continue to pass as later ones are added.
 
 ---
 

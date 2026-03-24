@@ -30,6 +30,7 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::ptr::NonNull;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::autorelease::objc_autorelease;
 use crate::msg_send::objc_msg_lookup;
@@ -50,20 +51,18 @@ static WEAK_LOCKS: LazyLock<[Mutex<()>; 8]> =
 
 /// A non-null pointer to a weak-reference slot (`Id` variable).
 ///
-/// Encapsulates the stripe-lock logic so the `unsafe impl Send/Sync` is
-/// narrowed to this type rather than the whole `SideTableEntry`.
+/// The pointer is stored as `AtomicPtr<Id>`, which is `Send + Sync`
+/// unconditionally, avoiding any `unsafe impl`. The atomic is not used for
+/// synchronisation — actual slot reads/writes are protected by the stripe lock
+/// from `WEAK_LOCKS`. `Relaxed` ordering suffices because the pointer value is
+/// written once in `new()` under a DashMap shard lock, and any thread that
+/// subsequently observes this `WeakLocation` from the map has already
+/// synchronised through that same lock.
 ///
 /// # Safety invariant
 /// All reads and writes through the inner pointer must be performed while
-/// holding the guard returned by `acquire()`.
-struct WeakLocation(NonNull<Id>);
-
-// SAFETY: `WeakLocation` is Send + Sync because the inner pointer is only
-// accessed while holding the stripe lock locked by acquire, so it can be
-// thought of morally like `Mutex<NonNull<Id>>` (but without the poisoning
-// semantics).
-unsafe impl Send for WeakLocation {}
-unsafe impl Sync for WeakLocation {}
+/// holding the guard returned by `lock()`.
+struct WeakLocation(AtomicPtr<Id>);
 
 /// RAII guard that holds a stripe lock for a weak-pointer slot.
 ///
@@ -91,31 +90,34 @@ impl<T> std::ops::DerefMut for ProxyGuard<T> {
 
 impl WeakLocation {
     fn new(ptr: NonNull<Id>) -> Self {
-        WeakLocation(ptr)
+        WeakLocation(AtomicPtr::new(ptr.as_ptr()))
     }
 
     /// Acquire the stripe lock for this location's address and return a guard.
     /// The slot must not be read or written except through the guard.
     fn lock(&self) -> ProxyGuard<NonNull<Id>> {
+        let raw = self.0.load(Ordering::Relaxed);
         ProxyGuard {
             // Stripe index derived from the location address (not the object
             // address), so the correct lock can be found without first reading
             // the potentially-racy pointer stored at the location.
-            _guard: WEAK_LOCKS[(self.0.as_ptr() as usize >> 3) % 8].lock(),
-            value: self.0,
+            _guard: WEAK_LOCKS[(raw as usize >> 3) % 8].lock(),
+            // SAFETY: `raw` was stored from a `NonNull<Id>` in `new()`, so it
+            // is non-null and aligned.
+            value: unsafe { NonNull::new_unchecked(raw) },
         }
     }
 }
 
 impl PartialEq for WeakLocation {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.0.load(Ordering::Relaxed) == other.0.load(Ordering::Relaxed)
     }
 }
 
 impl PartialEq<NonNull<Id>> for WeakLocation {
     fn eq(&self, other: &NonNull<Id>) -> bool {
-        self.0 == *other
+        self.0.load(Ordering::Relaxed) == other.as_ptr()
     }
 }
 
@@ -132,11 +134,6 @@ struct SideTableEntry {
     /// Inline size 0: most objects have no weak references.
     weak_locations: SmallVec<[WeakLocation; 0]>,
 }
-
-// SAFETY: WeakLocation is Send + Sync (its own unsafe impl); the other fields
-// are plain data. Access to weak slot memory is serialised by WEAK_LOCKS.
-unsafe impl Send for SideTableEntry {}
-unsafe impl Sync for SideTableEntry {}
 
 static TABLE: LazyLock<DashMap<usize, SideTableEntry>> = LazyLock::new(DashMap::new);
 
@@ -255,12 +252,9 @@ pub unsafe fn objc_init_weak(location: NonNull<Id>, obj: Id) -> Id {
     // SAFETY: `location` is non-null, properly aligned, and valid for writes
     // of `Id` (caller's contract).
     unsafe { *location.as_ptr() = None };
-    if obj.is_none() {
-        return None;
-    }
     // SAFETY: `location` was just written to `None` above, so it is initialised;
     // `obj` is `Some` and points to a live `ObjcObject` (caller's contract).
-    unsafe { objc_store_weak(location, obj) }
+    unsafe { objc_store_weak(location, Some(obj?)) }
 }
 
 /// Update the weak-pointer location `*location` to point to `new_obj`.
@@ -279,10 +273,10 @@ pub unsafe fn objc_store_weak(location: NonNull<Id>, new_obj: Id) -> Id {
     // SAFETY: `location` was initialised by `objc_init_weak` (caller's
     // contract), so it is non-null, aligned, and contains a valid `Id`.
     let old_obj = unsafe { guard.read() };
-    if let Some(old_obj) = old_obj {
-        if let Some(mut entry) = TABLE.get_mut(&(old_obj.as_ptr() as usize)) {
-            entry.weak_locations.retain(|loc| loc != &location);
-        }
+    if let Some(old_obj) = old_obj
+        && let Some(mut entry) = TABLE.get_mut(&(old_obj.as_ptr() as usize))
+    {
+        entry.weak_locations.retain(|loc| loc != &location);
     }
 
     if let Some(new_obj) = new_obj {
@@ -333,9 +327,7 @@ pub unsafe fn objc_load_weak_retained(location: NonNull<Id>) -> Id {
     // SAFETY: `location` was initialised by `objc_init_weak` (caller's
     // contract), so it is non-null, aligned, and contains a valid `Id`.
     let obj = unsafe { guard.read() };
-    if obj.is_none() {
-        return None;
-    }
+    obj?;
     // SAFETY: `obj` is `Some` (checked above), so it is a non-null, aligned
     // pointer to an `ObjcObject`. The object may be in the `deallocating`
     // state; `objc_retain` handles that case by returning `None`.

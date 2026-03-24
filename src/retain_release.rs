@@ -10,119 +10,94 @@
 //! # Weak reference safety
 //!
 //! Reading a weak pointer and retaining the object must be atomic with respect
-//! to the zeroing that happens on deallocation. A second striped lock set
-//! (`WEAK_LOCKS`, indexed by *location* address) protects the pointer value
-//! stored at each weak-reference slot.
+//! to the zeroing that happens on deallocation.  Each weak-pointer slot is
+//! treated as a `ShardedMutex<Id>` — the slot's *address* selects one of 127
+//! stripe locks from a global pool, and the guard provides `&mut Id` directly,
+//! so the mutex genuinely protects the data it guards.
 //!
 //! Lock ordering (never hold both simultaneously; always acquire in this order):
-//!   weak location lock  →  DashMap shard lock
+//!   weak slot lock  →  DashMap shard lock
 //!
 //! # Deallocation sequence
 //!
 //! 1. Decrement retain count to zero under the DashMap shard lock.
 //! 2. Set `deallocating = true`, extract `weak_locations`, release shard lock.
-//! 3. For each location: acquire its weak lock → write `None` → release.
+//! 3. For each location: acquire its slot lock → write `None` → release.
 //! 4. Call `-dealloc` (may safely retain/release other objects).
 //! 5. Remove the entry from the table.
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use sharded_mutex::{LockCount, ShardedMutex};
 use smallvec::SmallVec;
 use std::ptr::NonNull;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::ObjcObject;
 use crate::autorelease::objc_autorelease;
 use crate::msg_send::objc_msg_lookup;
 use crate::sel::sel_register_name_str;
+use crate::send_ptr::SendPtr;
 use crate::types::Id;
 
 // ---------------------------------------------------------------------------
-// Weak location locks
+// Weak slot locking via ShardedMutex
 //
-// Striped by location address (not object address), so they can be found
-// without first reading the (potentially racy) pointer value.
+// `ShardedMutex<Id, WeakSlotTag>` is `#[repr(transparent)]` around `Id`, so a
+// `*mut Id` (the user's weak variable) can be reinterpreted as a
+// `*mut ShardedMutex<Id, WeakSlotTag>`.  The slot's address selects one of 127
+// stripe locks from a global pool.
+// ---------------------------------------------------------------------------
 
-static WEAK_LOCKS: LazyLock<[Mutex<()>; 8]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+/// Tag type for the weak-slot locking domain, keeping its mutex pool separate
+/// from any other `ShardedMutex` users.
+struct WeakSlotTag;
+
+sharded_mutex::sharded_mutex!(WeakSlotTag: Id);
 
 // ---------------------------------------------------------------------------
-// WeakLocation
+// WeakSlot — a reference to a user's weak-pointer slot, viewed as a
+// ShardedMutex so that locking and data access are unified.
+// ---------------------------------------------------------------------------
 
-/// A non-null pointer to a weak-reference slot (`Id` variable).
+/// A weak-pointer slot, viewed as a `&ShardedMutex<Id>`.
 ///
-/// The pointer is stored as `AtomicPtr<Id>`, which is `Send + Sync`
-/// unconditionally, avoiding any `unsafe impl`. The atomic is not used for
-/// synchronisation — actual slot reads/writes are protected by the stripe lock
-/// from `WEAK_LOCKS`. `Relaxed` ordering suffices because the pointer value is
-/// written once in `new()` under a DashMap shard lock, and any thread that
-/// subsequently observes this `WeakLocation` from the map has already
-/// synchronised through that same lock.
+/// Created by reinterpreting the user's `*mut Id` through
+/// `#[repr(transparent)]`.  Stored in the side table so that `do_dealloc` can
+/// lock and zero each slot without a separate lookup.
 ///
-/// # Safety invariant
-/// All reads and writes through the inner pointer must be performed while
-/// holding the guard returned by `lock()`.
-struct WeakLocation(AtomicPtr<Id>);
+/// The `'static` lifetime is an upper bound — the ABI guarantees
+/// `objc_destroyWeak` is called (removing the entry) before the location is
+/// invalidated.
+struct WeakSlot(&'static ShardedMutex<Id, WeakSlotTag>);
 
-/// RAII guard that holds a stripe lock for a weak-pointer slot.
-///
-/// `Deref`s to `NonNull<Id>` — the pointer to the slot itself. Callers use
-/// `NonNull::read` and `NonNull::write` (both `unsafe`) to access the slot
-/// value; holding the guard is the precondition that makes those operations
-/// race-free.
-struct ProxyGuard<T> {
-    _guard: parking_lot::MutexGuard<'static, ()>,
-    value: T,
-}
+impl WeakSlot {
+    /// Cast a location pointer to a `WeakSlot`.
+    ///
+    /// # Safety
+    /// `location` must be non-null, properly aligned, and point to a valid
+    /// `Id` that remains live until `objc_destroyWeak` removes this entry.
+    unsafe fn from_ptr(location: NonNull<Id>) -> Self {
+        // SAFETY: caller guarantees the pointer is valid.
+        // `ShardedMutex<Id>` is `#[repr(transparent)]` around `Id`.
+        let p_sharded_lock = location.as_ptr().cast::<ShardedMutex<Id, WeakSlotTag>>();
+        WeakSlot(unsafe { &*p_sharded_lock })
+    }
 
-impl<T> std::ops::Deref for ProxyGuard<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.value
+    /// Return the raw location address (for equality comparisons).
+    fn addr(&self) -> *const Id {
+        std::ptr::from_ref(self.0).cast::<Id>()
     }
 }
 
-impl<T> std::ops::DerefMut for ProxyGuard<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
-    }
-}
-
-impl WeakLocation {
-    fn new(ptr: NonNull<Id>) -> Self {
-        WeakLocation(AtomicPtr::new(ptr.as_ptr()))
-    }
-
-    /// Acquire the stripe lock for this location's address and return a guard.
-    /// The slot must not be read or written except through the guard.
-    fn lock(&self) -> ProxyGuard<NonNull<Id>> {
-        let raw = self.0.load(Ordering::Relaxed);
-        ProxyGuard {
-            // Stripe index derived from the location address (not the object
-            // address), so the correct lock can be found without first reading
-            // the potentially-racy pointer stored at the location.
-            _guard: WEAK_LOCKS[(raw as usize >> 3) % 8].lock(),
-            // SAFETY: `raw` was stored from a `NonNull<Id>` in `new()`, so it
-            // is non-null and aligned.
-            value: unsafe { NonNull::new_unchecked(raw) },
-        }
-    }
-}
-
-impl PartialEq for WeakLocation {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.load(Ordering::Relaxed) == other.0.load(Ordering::Relaxed)
-    }
-}
-
-impl PartialEq<NonNull<Id>> for WeakLocation {
-    fn eq(&self, other: &NonNull<Id>) -> bool {
-        self.0.load(Ordering::Relaxed) == other.as_ptr()
-    }
-}
+// SAFETY: The `&'static ShardedMutex<Id>` inside points to a user-owned weak
+// slot whose access is serialized through the ShardedMutex stripe lock.
+// `ShardedMutex<Id>` itself is `!Sync` (because `Id` contains `NonNull` which
+// is `!Send`), but our `ObjcObject` has manual `Send + Sync` impls and all
+// access goes through the lock, so sending/sharing the reference is safe.
 
 // ---------------------------------------------------------------------------
 // Side table
+// ---------------------------------------------------------------------------
 
 struct SideTableEntry {
     /// Actual retain count. Absent from the map ↔ implicit count of 1.
@@ -130,15 +105,21 @@ struct SideTableEntry {
     /// Set before weak refs are zeroed and `-dealloc` is called.
     /// Prevents concurrent `objc_retain` from reviving a dying object.
     deallocating: bool,
-    /// Weak-pointer locations to zero when this object deallocates.
+    /// Weak-pointer slots to zero when this object deallocates.
     /// Inline size 0: most objects have no weak references.
-    weak_locations: SmallVec<[WeakLocation; 0]>,
+    weak_locations: SmallVec<[WeakSlot; 0]>,
 }
 
-static TABLE: LazyLock<DashMap<usize, SideTableEntry>> = LazyLock::new(DashMap::new);
+// `WeakSlot` is `Send + Sync` via its `&'static ShardedMutex` field, but the
+// auto-trait checker can't see through the `DashMap` to verify.  The entry
+// as a whole is safe: `usize`, `bool`, and `SmallVec<[WeakSlot]>` are all
+// `Send + Sync`.
+
+static TABLE: LazyLock<DashMap<SendPtr<ObjcObject>, SideTableEntry>> = LazyLock::new(DashMap::new);
 
 // ---------------------------------------------------------------------------
 // Retain / release
+// ---------------------------------------------------------------------------
 
 /// Increment the retain count of `obj` and return it, or return `None` if the
 /// object has begun deallocation.
@@ -147,13 +128,11 @@ static TABLE: LazyLock<DashMap<usize, SideTableEntry>> = LazyLock::new(DashMap::
 /// `obj` must be `None` or point to a live `ObjcObject`.
 pub unsafe fn objc_retain(obj: Id) -> Id {
     let obj = obj?;
-    let mut entry = TABLE
-        .entry(obj.as_ptr() as usize)
-        .or_insert(SideTableEntry {
-            retain_count: 1,
-            deallocating: false,
-            weak_locations: SmallVec::new(),
-        });
+    let mut entry = TABLE.entry(obj).or_insert(SideTableEntry {
+        retain_count: 1,
+        deallocating: false,
+        weak_locations: SmallVec::new(),
+    });
     if entry.deallocating {
         return None;
     }
@@ -167,9 +146,9 @@ pub unsafe fn objc_retain(obj: Id) -> Id {
 /// `obj` must be `None` or point to a live `ObjcObject`.
 pub unsafe fn objc_release(obj: Id) {
     let Some(obj) = obj else { return };
-    let addr = obj.as_ptr() as usize;
+    let key = obj;
 
-    let weak_locations = match TABLE.entry(addr) {
+    let weak_locations = match TABLE.entry(key) {
         dashmap::mapref::entry::Entry::Vacant(_) => {
             // Absent → implicit count 1; releasing drops to 0.
             // No weak locations possible (they require a table entry).
@@ -182,7 +161,7 @@ pub unsafe fn objc_release(obj: Id) {
             }
             if e.get().retain_count <= 1 {
                 // Mark deallocating and extract weak locations under the shard
-                // lock, then release it before touching any weak location lock.
+                // lock, then release it before touching any slot lock.
                 let entry = e.get_mut();
                 entry.deallocating = true;
                 Some(std::mem::take(&mut entry.weak_locations))
@@ -198,35 +177,31 @@ pub unsafe fn objc_release(obj: Id) {
         // live `ObjcObject` (caller's invariant). `deallocating` is set and
         // `weak_locations` has been extracted from the entry.
         unsafe { do_dealloc(Some(obj), weak_locations) };
-        TABLE.remove(&addr);
+        TABLE.remove(&key);
     }
 }
 
 /// Return the current retain count of `obj` (primarily for debugging).
 pub fn objc_retain_count(obj: Id) -> usize {
     let Some(obj) = obj else { return 0 };
-    TABLE
-        .get(&(obj.as_ptr() as usize))
-        .map_or(1, |e| e.retain_count)
+    TABLE.get(&(obj)).map_or(1, |e| e.retain_count)
 }
 
 // ---------------------------------------------------------------------------
 // Deallocation
+// ---------------------------------------------------------------------------
 
-/// Zero each weak location (under its lock), then call `-dealloc`.
+/// Zero each weak location (under its slot lock), then call `-dealloc`.
 ///
 /// # Safety
 /// `obj` must be `Some`. The side table entry must have `deallocating = true`
 /// and `weak_locations` must have been extracted from it.
-unsafe fn do_dealloc(obj: Id, weak_locations: SmallVec<[WeakLocation; 0]>) {
-    for loc in &weak_locations {
-        let guard = loc.lock();
-        // The stripe lock is held, so this write is race-free with any
+unsafe fn do_dealloc(obj: Id, weak_locations: SmallVec<[WeakSlot; 0]>) {
+    for ws in &weak_locations {
+        let mut guard = ws.0.lock();
+        // The slot lock is held, so this write is race-free with any
         // concurrent `objc_load_weak_retained` on this location.
-        // SAFETY: `loc` was registered via `objc_init_weak`/`objc_store_weak`
-        // (caller's contract), so the pointer is non-null, properly aligned,
-        // and valid for writes of `Id`.
-        unsafe { guard.write(None) };
+        *guard = None;
     }
 
     let dealloc_sel = sel_register_name_str("dealloc");
@@ -243,6 +218,7 @@ unsafe fn do_dealloc(obj: Id, weak_locations: SmallVec<[WeakLocation; 0]>) {
 
 // ---------------------------------------------------------------------------
 // Weak references
+// ---------------------------------------------------------------------------
 
 /// Initialise the weak-pointer location `*location` to point to `obj`.
 ///
@@ -265,52 +241,35 @@ pub unsafe fn objc_init_weak(location: NonNull<Id>, obj: Id) -> Id {
 /// `location` must have been initialised by `objc_init_weak`. `new_obj` must
 /// be `None` or point to a live `ObjcObject`.
 pub unsafe fn objc_store_weak(location: NonNull<Id>, new_obj: Id) -> Id {
-    let wl = WeakLocation::new(location);
-    let guard = wl.lock();
+    // SAFETY: `location` is non-null, aligned, and points to a valid `Id`
+    // (caller's contract).
+    let ws = unsafe { WeakSlot::from_ptr(location) };
+    let mut guard = ws.0.lock();
 
-    // The stripe lock is held, so this read is race-free with any concurrent
-    // `do_dealloc` zeroing this location.
-    // SAFETY: `location` was initialised by `objc_init_weak` (caller's
-    // contract), so it is non-null, aligned, and contains a valid `Id`.
-    let old_obj = unsafe { guard.read() };
+    let old_obj = *guard;
     if let Some(old_obj) = old_obj
-        && let Some(mut entry) = TABLE.get_mut(&(old_obj.as_ptr() as usize))
+        && let Some(mut entry) = TABLE.get_mut(&old_obj)
     {
-        entry.weak_locations.retain(|loc| loc != &location);
+        let loc = location.as_ptr() as *const Id;
+        entry.weak_locations.retain(|w| w.addr() != loc);
     }
 
     if let Some(new_obj) = new_obj {
-        let mut entry = TABLE
-            .entry(new_obj.as_ptr() as usize)
-            .or_insert(SideTableEntry {
-                retain_count: 1,
-                deallocating: false,
-                weak_locations: SmallVec::new(),
-            });
+        let mut entry = TABLE.entry(new_obj).or_insert(SideTableEntry {
+            retain_count: 1,
+            deallocating: false,
+            weak_locations: SmallVec::new(),
+        });
         if entry.deallocating {
-            // The stripe lock is held, preventing concurrent reads of this
-            // location by `objc_load_weak_retained`.
-            // SAFETY: `location` was initialised by `objc_init_weak`
-            // (caller's contract), so it is non-null, aligned, and valid
-            // for writes of `Id`.
-            unsafe { guard.write(None) };
+            *guard = None;
             return None;
         }
-        entry.weak_locations.push(wl);
-        // The stripe lock is held, preventing concurrent reads of this
-        // location by `objc_load_weak_retained`.
-        // SAFETY: `location` was initialised by `objc_init_weak`
-        // (caller's contract), so it is non-null, aligned, and valid for
-        // writes of `Id`. `new_obj` is a valid `NonNull<ObjcObject>`
-        // (destructured from `Some`).
-        unsafe { guard.write(Some(new_obj)) };
+        entry.weak_locations.push(ws);
+        *guard = Some(new_obj);
         return Some(new_obj);
     }
 
-    // The stripe lock is held, preventing concurrent reads of this location.
-    // SAFETY: `location` was initialised by `objc_init_weak` (caller's
-    // contract), so it is non-null, aligned, and valid for writes of `Id`.
-    unsafe { guard.write(None) };
+    *guard = None;
     None
 }
 
@@ -322,11 +281,13 @@ pub unsafe fn objc_store_weak(location: NonNull<Id>, new_obj: Id) -> Id {
 /// # Safety
 /// `location` must have been initialised by `objc_init_weak`.
 pub unsafe fn objc_load_weak_retained(location: NonNull<Id>) -> Id {
-    let guard = WeakLocation::new(location).lock();
-    // The stripe lock is held, preventing concurrent zeroing by `do_dealloc`.
-    // SAFETY: `location` was initialised by `objc_init_weak` (caller's
-    // contract), so it is non-null, aligned, and contains a valid `Id`.
-    let obj = unsafe { guard.read() };
+    // SAFETY: `location` is non-null, aligned, and points to a valid `Id`
+    // (caller's contract).
+    let ws = unsafe { WeakSlot::from_ptr(location) };
+    let guard = ws.0.lock();
+
+    // The slot lock is held, preventing concurrent zeroing by `do_dealloc`.
+    let obj = *guard;
     obj?;
     // SAFETY: `obj` is `Some` (checked above), so it is a non-null, aligned
     // pointer to an `ObjcObject`. The object may be in the `deallocating`
@@ -356,21 +317,17 @@ pub unsafe fn objc_load_weak(location: NonNull<Id>) -> Id {
 /// # Safety
 /// `location` must have been initialised by `objc_init_weak`.
 pub unsafe fn objc_destroy_weak(location: NonNull<Id>) {
-    let wl = WeakLocation::new(location);
-    let guard = wl.lock();
-    // The stripe lock is held, so this read is race-free with any concurrent
-    // `do_dealloc` zeroing this location.
-    // SAFETY: `location` was initialised by `objc_init_weak` (caller's
-    // contract), so it is non-null, aligned, and contains a valid `Id`.
-    let obj = unsafe { guard.read() };
+    // SAFETY: `location` is non-null, aligned, and points to a valid `Id`
+    // (caller's contract).
+    let ws = unsafe { WeakSlot::from_ptr(location) };
+    let mut guard = ws.0.lock();
+
+    let obj = *guard;
     if let Some(obj) = obj
-        && let Some(mut entry) = TABLE.get_mut(&(obj.as_ptr() as usize))
+        && let Some(mut entry) = TABLE.get_mut(&(obj))
     {
-        entry.weak_locations.retain(|loc| loc != &location);
+        let loc = location.as_ptr() as *const Id;
+        entry.weak_locations.retain(|w| w.addr() != loc);
     }
-    // The stripe lock is held, preventing concurrent reads of this location
-    // by `objc_load_weak_retained`.
-    // SAFETY: `location` was initialised by `objc_init_weak` (caller's
-    // contract), so it is non-null, aligned, and valid for writes of `Id`.
-    unsafe { guard.write(None) };
+    *guard = None;
 }

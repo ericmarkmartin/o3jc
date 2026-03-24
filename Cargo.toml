@@ -11,6 +11,7 @@ dashmap = "6"
 parking_lot = "0.12"
 libc = "0.2"
 smallvec = "1"
+sharded_mutex = "2.1.0"
 
 [lib]
 name = "o3jc"

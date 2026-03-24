@@ -9,6 +9,7 @@ pub mod method_cache;
 pub mod msg_send;
 pub mod retain_release;
 pub mod sel;
+mod send_ptr;
 pub mod types;
 
 use std::ptr::NonNull;
@@ -287,6 +288,7 @@ mod tests {
     use std::ptr::NonNull;
 
     use super::*;
+    use crate::send_ptr::SendPtr;
 
     // -----------------------------------------------------------------------
     // Selector interning
@@ -371,7 +373,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             let found = objc_msg_lookup(id, sel);
             assert!(found.is_some(), "IMP must be found for registered method");
@@ -415,7 +417,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(child).unwrap(),
             };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             let found = objc_msg_lookup(id, sel);
             assert!(
@@ -481,7 +483,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(child).unwrap(),
             };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             let found = objc_msg_lookup(id, sel);
             assert!(found.is_some());
@@ -525,7 +527,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             // First lookup: slow path, fills cache.
             let found1 = objc_msg_lookup(id, sel);
@@ -580,7 +582,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             // Warm the cache for sel_a.
             let _ = objc_msg_lookup(id, sel_a);
@@ -617,8 +619,10 @@ mod tests {
         unsafe {
             let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
             objc_registerClassPair(cls);
-            let mut obj = ObjcObject { isa: NonNull::new(cls).unwrap() };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let mut obj = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             // Fresh object has implicit count of 1.
             assert_eq!(retain_release::objc_retain_count(id), 1);
@@ -658,11 +662,16 @@ mod tests {
             class_addMethod(cls, dealloc_sel, imp, std::ptr::null());
             objc_registerClassPair(cls);
 
-            let mut obj = ObjcObject { isa: NonNull::new(cls).unwrap() };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let mut obj = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             objc_release(id);
-            assert!(DEALLOC_CALLED.load(Ordering::SeqCst), "-dealloc must be called on release-to-zero");
+            assert!(
+                DEALLOC_CALLED.load(Ordering::SeqCst),
+                "-dealloc must be called on release-to-zero"
+            );
         }
     }
 
@@ -690,16 +699,28 @@ mod tests {
             objc_registerClassPair(cls);
             drop(sel_name);
 
-            let mut obj1 = ObjcObject { isa: NonNull::new(cls).unwrap() };
-            let mut obj2 = ObjcObject { isa: NonNull::new(cls).unwrap() };
+            let mut obj1 = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
+            let mut obj2 = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
 
             let token = objc_autoreleasePoolPush();
-            objc_autorelease(Some(NonNull::from(&mut obj1)));
-            objc_autorelease(Some(NonNull::from(&mut obj2)));
+            objc_autorelease(Some(SendPtr::from(NonNull::from(&mut obj1))));
+            objc_autorelease(Some(SendPtr::from(NonNull::from(&mut obj2))));
 
-            assert_eq!(AUTORELEASE_RELEASED.load(Ordering::SeqCst), 0, "no releases before pop");
+            assert_eq!(
+                AUTORELEASE_RELEASED.load(Ordering::SeqCst),
+                0,
+                "no releases before pop"
+            );
             objc_autoreleasePoolPop(token);
-            assert_eq!(AUTORELEASE_RELEASED.load(Ordering::SeqCst), 2, "both objects released on pop");
+            assert_eq!(
+                AUTORELEASE_RELEASED.load(Ordering::SeqCst),
+                2,
+                "both objects released on pop"
+            );
         }
     }
 
@@ -713,8 +734,10 @@ mod tests {
             let cls = objc_allocateClassPair(std::ptr::null_mut(), class_name.as_ptr(), 0);
             objc_registerClassPair(cls);
 
-            let mut obj = ObjcObject { isa: NonNull::new(cls).unwrap() };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let mut obj = ObjcObject {
+                isa: NonNull::new(cls).unwrap(),
+            };
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
 
             let mut weak_slot: Id = None;
             let weak_slot_ptr = NonNull::from(&mut weak_slot);
@@ -723,12 +746,19 @@ mod tests {
             // Load inside a pool so the autoreleased retain is balanced before
             // we call the final release.
             let token = objc_autoreleasePoolPush();
-            assert_eq!(objc_loadWeak(weak_slot_ptr), id, "weak ref must point to live object");
+            assert_eq!(
+                objc_loadWeak(weak_slot_ptr),
+                id,
+                "weak ref must point to live object"
+            );
             objc_autoreleasePoolPop(token);
 
             // Release to zero → dealloc → weak slot zeroed.
             objc_release(id);
-            assert!(objc_loadWeak(weak_slot_ptr).is_none(), "weak ref must be nil after dealloc");
+            assert!(
+                objc_loadWeak(weak_slot_ptr).is_none(),
+                "weak ref must be nil after dealloc"
+            );
         }
     }
 
@@ -755,7 +785,7 @@ mod tests {
             let mut obj = ObjcObject {
                 isa: NonNull::new(cls).unwrap(),
             };
-            let id: Id = Some(NonNull::from(&mut obj));
+            let id: Id = Some(SendPtr::from(NonNull::from(&mut obj)));
             assert!(
                 objc_msg_lookup(id, sel).is_none(),
                 "method must not exist before post-registration add"
@@ -768,7 +798,10 @@ mod tests {
 
             // Now dispatch must find it.
             let found = objc_msg_lookup(id, sel);
-            assert!(found.is_some(), "method must be found after post-registration add");
+            assert!(
+                found.is_some(),
+                "method must be found after post-registration add"
+            );
             let f: unsafe extern "C" fn() = std::mem::transmute(found.unwrap());
             f();
             assert!(POST_REG_CALLED.load(Ordering::SeqCst));

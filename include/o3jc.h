@@ -16,6 +16,8 @@ typedef struct objc_class objc_class;
  */
 #define CLASS_IS_METACLASS (1 << 1)
 
+typedef struct Option_SendPtr_ObjcObject Option_SendPtr_ObjcObject;
+
 typedef struct Vec_MethodEntry Vec_MethodEntry;
 
 /**
@@ -50,11 +52,14 @@ typedef struct objc_selector *SEL;
 /**
  * An opaque object reference (`id` in Objective-C).
  *
- * `None` is the equivalent of Objective-C `nil`. `Option<NonNull<T>>` has the
- * null-pointer niche optimization, so it is ABI-compatible with `*mut T` at
- * the C boundary.
+ * `None` is the equivalent of Objective-C `nil`. `SendPtr` is
+ * `#[repr(transparent)]` around `NonNull`, so `Option<SendPtr<T>>` has the
+ * same null-pointer niche optimization and is ABI-compatible with `*mut T`.
+ *
+ * Using `SendPtr` (rather than bare `NonNull`) makes `Id` `Send + Sync`,
+ * which propagates through `ShardedMutex<Id>`, `DashMap`, etc.
  */
-typedef struct objc_object *Id;
+typedef struct Option_SendPtr_ObjcObject Id;
 
 /**
  * A method implementation.

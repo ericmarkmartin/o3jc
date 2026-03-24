@@ -3,12 +3,14 @@ use std::ptr::NonNull;
 
 /// The base layout of every Objective-C object.
 /// `isa` lives at offset 0 as required by the GNUstep v2 ABI.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct ObjcObject {
     pub isa: NonNull<ObjcClass>,
 }
 
 // SAFETY: The runtime owns all synchronization invariants for ObjC objects.
+// Access is serialized through the side table's DashMap shard locks.
 unsafe impl Send for ObjcObject {}
 unsafe impl Sync for ObjcObject {}
 
@@ -33,10 +35,13 @@ pub type SEL = NonNull<ObjcSelector>;
 
 /// An opaque object reference (`id` in Objective-C).
 ///
-/// `None` is the equivalent of Objective-C `nil`. `Option<NonNull<T>>` has the
-/// null-pointer niche optimization, so it is ABI-compatible with `*mut T` at
-/// the C boundary.
-pub type Id = Option<NonNull<ObjcObject>>;
+/// `None` is the equivalent of Objective-C `nil`. `SendPtr` is
+/// `#[repr(transparent)]` around `NonNull`, so `Option<SendPtr<T>>` has the
+/// same null-pointer niche optimization and is ABI-compatible with `*mut T`.
+///
+/// Using `SendPtr` (rather than bare `NonNull`) makes `Id` `Send + Sync`,
+/// which propagates through `ShardedMutex<Id>`, `DashMap`, etc.
+pub type Id = Option<crate::send_ptr::SendPtr<ObjcObject>>;
 
 /// A method implementation.
 ///

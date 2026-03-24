@@ -59,6 +59,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "assoc_static"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1414226a97fb98b4b47e1a834ec01908b5a18c02fd327641bb5f6246e9fc5d2e"
+
+[[package]]
+name = "assoc_threadlocal"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e59eadb0f0a0ec4a35b0c05bef916d014c148c42ffe08e425f044db31272f9f"
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -293,6 +305,7 @@ dependencies = [
  "dashmap",
  "libc",
  "parking_lot",
+ "sharded_mutex",
  "smallvec",
 ]
 
@@ -449,6 +462,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "sharded_mutex"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4eb4733eff7d2d8c17a71d0a183b5656c82cecf51374a0fd0a95e5246818350b"
+dependencies = [
+ "assoc_static",
+ "assoc_threadlocal",
+ "parking_lot",
 ]
 
 [[package]]

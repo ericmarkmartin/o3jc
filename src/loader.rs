@@ -275,9 +275,9 @@ unsafe fn patch_class(cls: &mut ObjcClass) {
 /// `ObjcClass`. `load_selectors` must have been called first.
 unsafe fn load_classes(class_ptrs: &[*mut ObjcClass]) {
     for &cls_ptr in class_ptrs {
-        if cls_ptr.is_null() {
+        let Some(cls_nn) = NonNull::new(cls_ptr) else {
             continue; // Skip null sentinels.
-        }
+        };
         // SAFETY: cls_ptr is a non-null Clang-emitted class struct.
         let cls = unsafe { &mut *cls_ptr };
 
@@ -295,7 +295,7 @@ unsafe fn load_classes(class_ptrs: &[*mut ObjcClass]) {
 
             // Root metaclass super_class → root class.
             if meta.super_class.is_none() && cls.super_class.is_none() {
-                meta.super_class = NonNull::new(cls_ptr);
+                meta.super_class = Some(cls_nn);
             }
         }
 

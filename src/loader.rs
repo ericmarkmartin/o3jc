@@ -27,8 +27,8 @@ use crate::types::*;
 /// After fixup, `name` is overwritten with the interned name pointer so that
 /// the struct can serve as an `ObjcSelector` for dispatch.
 #[repr(C)]
-struct CompiledSelector {
-    name: *mut c_char,
+pub struct CompiledSelector {
+    name: *const c_char,
     types: *const c_char,
 }
 
@@ -59,84 +59,114 @@ struct CompiledMethodEntry {
 
 /// The struct Clang emits as `.objc_init` and passes to `__objc_load`.
 ///
-/// Layout (17 fields, all `#[repr(C)]`):
-/// ```text
-/// { i64 version,
-///   i8** sel_start,  i8** sel_stop,
-///   i8** cls_start,  i8** cls_stop,
-///   i8** ref_start,  i8** ref_stop,
-///   i8** cat_start,  i8** cat_stop,
-///   i8** pro_start,  i8** pro_stop,
-///   i8** prf_start,  i8** prf_stop,
-///   i8** ali_start,  i8** ali_stop,
-///   i8** str_start,  i8** str_stop }
-/// ```
+/// All pointer pairs are start/stop bounds into ELF sections. Sections that
+/// are not yet processed use `*const u8` as a placeholder type.
 #[repr(C)]
 pub struct ObjcModuleInfo {
-    pub version: i64,
+    version: i64,
 
     // __objc_selectors — array of { *name, *types } structs
-    pub sel_start: *mut *mut c_char,
-    pub sel_stop:  *mut *mut c_char,
+    sel_start: *mut CompiledSelector,
+    sel_stop:  *mut CompiledSelector,
 
-    // __objc_classes — array of class pointers
-    pub classes_start: *mut *mut u8,
-    pub classes_stop:  *mut *mut u8,
+    // __objc_classes — array of pointers to class structs
+    classes_start: *const *mut ObjcClass,
+    classes_stop:  *const *mut ObjcClass,
 
-    // __objc_class_refs
-    pub class_refs_start: *mut *mut u8,
-    pub class_refs_stop:  *mut *mut u8,
+    // __objc_class_refs (Phase 6+)
+    class_refs_start: *const u8,
+    class_refs_stop:  *const u8,
 
-    // __objc_cats
-    pub cats_start: *mut *mut u8,
-    pub cats_stop:  *mut *mut u8,
+    // __objc_cats (Phase 8)
+    cats_start: *const u8,
+    cats_stop:  *const u8,
 
-    // __objc_protocols
-    pub protocols_start: *mut *mut u8,
-    pub protocols_stop:  *mut *mut u8,
+    // __objc_protocols (Phase 9)
+    protocols_start: *const u8,
+    protocols_stop:  *const u8,
 
-    // __objc_protocol_refs
-    pub protocol_refs_start: *mut *mut u8,
-    pub protocol_refs_stop:  *mut *mut u8,
+    // __objc_protocol_refs (Phase 9)
+    protocol_refs_start: *const u8,
+    protocol_refs_stop:  *const u8,
 
     // __objc_class_aliases
-    pub class_aliases_start: *mut *mut u8,
-    pub class_aliases_stop:  *mut *mut u8,
+    class_aliases_start: *const u8,
+    class_aliases_stop:  *const u8,
 
     // __objc_constant_string
-    pub constant_strings_start: *mut *mut u8,
-    pub constant_strings_stop:  *mut *mut u8,
+    constant_strings_start: *const u8,
+    constant_strings_stop:  *const u8,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build a slice from a start/stop pointer pair.
+///
+/// Returns an empty slice if `start >= stop` or either pointer is null.
+///
+/// # Safety
+/// `start` and `stop` must bracket a valid, contiguous array of `T`.
+unsafe fn section_slice<'a, T>(start: *const T, stop: *const T) -> &'a [T] {
+    if start.is_null() || stop.is_null() || start >= stop {
+        return &[];
+    }
+    let count = unsafe { stop.offset_from(start) } as usize;
+    unsafe { std::slice::from_raw_parts(start, count) }
+}
+
+/// Mutable version of `section_slice`.
+///
+/// # Safety
+/// Same as `section_slice`, plus the caller must ensure exclusive access.
+unsafe fn section_slice_mut<'a, T>(start: *mut T, stop: *mut T) -> &'a mut [T] {
+    if start.is_null() || stop.is_null() || start >= stop {
+        return &mut [];
+    }
+    let count = unsafe { stop.offset_from(start) } as usize;
+    unsafe { std::slice::from_raw_parts_mut(start, count) }
+}
+
+impl ObjcModuleInfo {
+    /// Return the `__objc_selectors` section as a mutable slice.
+    ///
+    /// # Safety
+    /// The `sel_start`/`sel_stop` pointers must bracket valid section data.
+    unsafe fn selectors_mut(&mut self) -> &mut [CompiledSelector] {
+        unsafe { section_slice_mut(self.sel_start, self.sel_stop) }
+    }
+
+    /// Return the `__objc_classes` section as a slice of class pointers.
+    ///
+    /// # Safety
+    /// The `classes_start`/`classes_stop` pointers must bracket valid section data.
+    unsafe fn classes(&self) -> &[*mut ObjcClass] {
+        unsafe { section_slice(self.classes_start, self.classes_stop) }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Selector fixup
 // ---------------------------------------------------------------------------
 
-/// Walk `__objc_selectors` and intern each selector name.
+/// Intern each selector name in the slice.
 ///
-/// After this function returns, every `CompiledSelector.name` in the section
-/// has been overwritten with the stable interned name pointer, making the
-/// struct usable as an `ObjcSelector { name, types }` for dispatch.
-///
-/// # Safety
-/// `start` and `stop` must bracket a valid `__objc_selectors` ELF section.
-unsafe fn load_selectors(start: *mut *mut c_char, stop: *mut *mut c_char) {
-    let mut ptr = start as *mut CompiledSelector;
-    let end = stop as *mut CompiledSelector;
-    while ptr < end {
-        // SAFETY: ptr is within the section bounds.
-        let entry = unsafe { &mut *ptr };
-        if !entry.name.is_null() {
-            // SAFETY: Clang emits valid null-terminated name strings.
-            let name_str = unsafe { CStr::from_ptr(entry.name) }
-                .to_str()
-                .expect("selector name must be valid UTF-8");
-            let interned = intern_selector_name(name_str);
-            // Overwrite the name pointer with the interned version.
-            entry.name = interned as *mut c_char;
+/// After this function returns, every `CompiledSelector.name` has been
+/// overwritten with the stable interned name pointer, making the struct
+/// usable as an `ObjcSelector { name, types }` for dispatch.
+fn load_selectors(selectors: &mut [CompiledSelector]) {
+    for entry in selectors {
+        if entry.name.is_null() {
+            continue; // Skip null sentinels.
         }
-        // SAFETY: advancing within section bounds.
-        ptr = unsafe { ptr.add(1) };
+        // SAFETY: Clang emits valid null-terminated name strings.
+        let name_str = unsafe { CStr::from_ptr(entry.name) }
+            .to_str()
+            .expect("selector name must be valid UTF-8");
+        let interned = intern_selector_name(name_str);
+        // Overwrite the name pointer with the interned version.
+        entry.name = interned;
     }
 }
 
@@ -170,28 +200,29 @@ unsafe fn convert_method_list(
     }
 
     // The entries array starts right after the header.
-    let entries_ptr = unsafe {
+    let entries_start = unsafe {
         (header as *const u8).add(std::mem::size_of::<CompiledMethodList>())
     } as *const CompiledMethodEntry;
 
-    let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        // SAFETY: `i < count` and the compiled method list has `count` inline entries.
-        let ce = unsafe { &*entries_ptr.add(i) };
+    // SAFETY: the compiled method list has `count` inline entries after the header.
+    let compiled_entries = unsafe { std::slice::from_raw_parts(entries_start, count) };
 
-        // The selector's `name` field was fixed up by load_selectors to hold
-        // the interned name pointer. Cast the CompiledSelector* to SEL
-        // (NonNull<ObjcSelector>) — the CompiledSelector and ObjcSelector
-        // have identical layout: { *name, *types }.
-        // SAFETY: ce.sel was written by Clang and is non-null for real methods.
-        let sel = unsafe { NonNull::new_unchecked(ce.sel as *mut ObjcSelector) };
-
-        entries.push(MethodEntry {
-            imp: ce.imp,
-            sel,
-            types: ce.types,
-        });
-    }
+    let entries = compiled_entries
+        .iter()
+        .map(|ce| {
+            // The selector's `name` field was fixed up by load_selectors to hold
+            // the interned name pointer. Cast the CompiledSelector* to SEL
+            // (NonNull<ObjcSelector>) — the CompiledSelector and ObjcSelector
+            // have identical layout: { *name, *types }.
+            // SAFETY: ce.sel was written by Clang and is non-null for real methods.
+            let sel = unsafe { NonNull::new_unchecked(ce.sel as *mut ObjcSelector) };
+            MethodEntry {
+                imp: ce.imp,
+                sel,
+                types: ce.types,
+            }
+        })
+        .collect();
 
     Some(NonNull::from(Box::leak(Box::new(MethodList {
         next: None,
@@ -203,88 +234,64 @@ unsafe fn convert_method_list(
 // Class loading
 // ---------------------------------------------------------------------------
 
-/// Walk `__objc_classes` and register each Clang-emitted class.
-///
-/// For each class:
-/// 1. Patch `instance_size` (negate if negative; set minimum for root classes)
-/// 2. Convert compiled method lists to runtime format
-/// 3. Set up root metaclass ISA chain (self-loop)
-/// 4. Initialize the method cache (stored in `dtable`)
-/// 5. Register in the global class table
+/// Patch a single class struct: fix instance_size, convert method list, init cache.
 ///
 /// # Safety
-/// `start` and `stop` must bracket a valid `__objc_classes` ELF section.
+/// `cls` must point to a valid Clang-emitted `ObjcClass`.
 /// `load_selectors` must have been called first.
-unsafe fn load_classes(start: *mut *mut u8, stop: *mut *mut u8) {
-    let mut ptr = start as *mut *mut ObjcClass;
-    let end = stop as *mut *mut ObjcClass;
-    while ptr < end {
-        // SAFETY: ptr is within section bounds.
-        let cls_ptr: *mut ObjcClass = unsafe { *ptr };
+unsafe fn patch_class(cls: &mut ObjcClass) {
+    if cls.instance_size < 0 {
+        cls.instance_size = -cls.instance_size;
+    }
+    if cls.instance_size == 0 && cls.super_class.is_none() {
+        cls.instance_size = std::mem::size_of::<ObjcObject>() as i64;
+    }
+
+    // Convert compiled method list to runtime format.
+    let raw_methods = cls
+        .method_list
+        .map(|nn| nn.as_ptr() as *const ())
+        .unwrap_or(std::ptr::null());
+    cls.method_list = unsafe { convert_method_list(raw_methods) };
+
+    // Initialize per-class method cache (stored in dtable).
+    let cache = NonNull::from(Box::leak(MethodCache::new()));
+    cls.set_cache(Some(cache));
+}
+
+/// Register each Clang-emitted class in the slice.
+///
+/// # Safety
+/// Each non-null pointer in `class_ptrs` must point to a valid Clang-emitted
+/// `ObjcClass`. `load_selectors` must have been called first.
+unsafe fn load_classes(class_ptrs: &[*mut ObjcClass]) {
+    for &cls_ptr in class_ptrs {
         if cls_ptr.is_null() {
-            // Skip null sentinels.
-            ptr = unsafe { ptr.add(1) };
-            continue;
+            continue; // Skip null sentinels.
         }
         // SAFETY: cls_ptr is a non-null Clang-emitted class struct.
         let cls = unsafe { &mut *cls_ptr };
 
-        // --- Patch instance_size ---
-        if cls.instance_size < 0 {
-            cls.instance_size = -cls.instance_size;
-        }
-        if cls.instance_size == 0 && cls.super_class.is_none() {
-            cls.instance_size = std::mem::size_of::<ObjcObject>() as i64;
-        }
+        unsafe { patch_class(cls) };
 
-        // --- Convert method list ---
-        let compiled_methods = cls.method_list;
-        // The method_list field currently holds a raw pointer to a CompiledMethodList.
-        // We need to read it as *const () and convert.
-        let raw_methods = compiled_methods
-            .map(|nn| nn.as_ptr() as *const ())
-            .unwrap_or(std::ptr::null());
-        cls.method_list = unsafe { convert_method_list(raw_methods) };
-
-        // --- Initialize cache ---
-        let cache = NonNull::from(Box::leak(MethodCache::new()));
-        cls.set_cache(Some(cache));
-
-        // --- Process metaclass ---
+        // Process the metaclass (pointed to by isa).
         if let Some(meta_nn) = cls.isa {
             let meta = unsafe { meta_nn.as_ptr().as_mut().unwrap() };
+            unsafe { patch_class(meta) };
 
-            // Patch metaclass instance_size
-            if meta.instance_size < 0 {
-                meta.instance_size = -meta.instance_size;
-            }
-
-            // Convert metaclass method list
-            let meta_raw_methods = meta.method_list
-                .map(|nn| nn.as_ptr() as *const ())
-                .unwrap_or(std::ptr::null());
-            meta.method_list = unsafe { convert_method_list(meta_raw_methods) };
-
-            // Initialize metaclass cache
-            let meta_cache = NonNull::from(Box::leak(MethodCache::new()));
-            meta.set_cache(Some(meta_cache));
-
-            // Root metaclass ISA: self-loop (metaclass.isa = metaclass)
+            // Root metaclass ISA: self-loop (metaclass.isa = metaclass).
             if meta.isa.is_none() {
                 meta.isa = Some(meta_nn);
             }
 
-            // Root metaclass super_class: points to the root class
+            // Root metaclass super_class → root class.
             if meta.super_class.is_none() && cls.super_class.is_none() {
                 meta.super_class = NonNull::new(cls_ptr);
             }
         }
 
-        // --- Register class ---
         // SAFETY: cls_ptr points to a valid, fully patched ObjcClass.
         unsafe { class_registry::register_loaded_class(cls_ptr) };
-
-        ptr = unsafe { ptr.add(1) };
     }
 }
 
@@ -301,9 +308,9 @@ unsafe fn load_classes(start: *mut *mut u8, stop: *mut *mut u8) {
 pub unsafe extern "C" fn __objc_load(info: *const ObjcModuleInfo) {
     debug_assert!(!info.is_null(), "__objc_load called with null info");
     // SAFETY: Clang guarantees `info` is non-null and correctly laid out.
-    let info = unsafe { &*info };
+    let info = unsafe { &mut *info.cast_mut() };
 
     // Selectors must be interned before classes (method lists reference them).
-    unsafe { load_selectors(info.sel_start, info.sel_stop) };
-    unsafe { load_classes(info.classes_start, info.classes_stop) };
+    load_selectors(unsafe { info.selectors_mut() });
+    unsafe { load_classes(info.classes()) };
 }

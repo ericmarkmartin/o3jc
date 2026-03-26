@@ -2,7 +2,6 @@
 // Tests: class loading, selector fixup, method list conversion,
 //        root metaclass ISA chain, objc_msgSend trampoline.
 #include <stdio.h>
-#include "gnustep_runtime.h"
 
 __attribute__((objc_root_class))
 @interface TestRoot

@@ -85,11 +85,14 @@ fn run_fixture(name: &str, expected: &str) {
         .args([
             "-fobjc-runtime=gnustep-2.0",
             "-fno-objc-arc",
-            "-I", &inc,
+            "-I",
+            &inc,
             "-Wall",
-            "-o", bin.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
             &src,
-            "-L", lib_dir,
+            "-L",
+            lib_dir,
             "-lo3jc",
             &rpath,
         ])
@@ -121,44 +124,72 @@ fn run_fixture(name: &str, expected: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn class_creation()  { run_fixture("class_creation", "1"); }
+fn class_creation() {
+    run_fixture("class_creation", "1");
+}
 
 #[test]
-fn class_invisible() { run_fixture("class_invisible", "1\n1"); }
+fn class_invisible() {
+    run_fixture("class_invisible", "1\n1");
+}
 
 #[test]
-fn class_add_method() { run_fixture("class_add_method", "1 0"); }
+fn class_add_method() {
+    run_fixture("class_add_method", "1 0");
+}
 
 #[test]
-fn selector_same() { run_fixture("selector_same", "1"); }
+fn selector_same() {
+    run_fixture("selector_same", "1");
+}
 
 #[test]
-fn selector_different() { run_fixture("selector_different", "1"); }
+fn selector_different() {
+    run_fixture("selector_different", "1");
+}
 
 #[test]
-fn msg_lookup_slow() { run_fixture("msg_lookup_slow", "1"); }
+fn msg_lookup_slow() {
+    run_fixture("msg_lookup_slow", "1");
+}
 
 #[test]
-fn imp_returns_self() { run_fixture("imp_returns_self", "1"); }
+fn imp_returns_self() {
+    run_fixture("imp_returns_self", "1");
+}
 
 #[test]
-fn cache_hit() { run_fixture("cache_hit", "1"); }
+fn cache_hit() {
+    run_fixture("cache_hit", "1");
+}
 
 #[test]
-fn unknown_selector() { run_fixture("unknown_selector", "1"); }
+fn unknown_selector() {
+    run_fixture("unknown_selector", "1");
+}
 
 #[test]
-fn null_receiver() { run_fixture("null_receiver", "1"); }
+fn null_receiver() {
+    run_fixture("null_receiver", "1");
+}
 
 #[test]
-fn introspection() { run_fixture("introspection", "1\n1"); }
+fn introspection() {
+    run_fixture("introspection", "1\n1");
+}
 
 #[test]
-fn subclass_inherits() { run_fixture("subclass_inherits", "1"); }
+fn subclass_inherits() {
+    run_fixture("subclass_inherits", "1");
+}
 
 #[test]
-fn method_swizzle() { run_fixture("method_swizzle", "1 0"); }
+fn method_swizzle() {
+    run_fixture("method_swizzle", "1 0");
+}
 
 // Phase 5: static class loading
 #[test]
-fn static_class() { run_fixture("static_class", "1"); }
+fn static_class() {
+    run_fixture("static_class", "1");
+}

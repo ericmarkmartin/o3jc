@@ -3,8 +3,8 @@ fn main() {
     let config_path = std::path::Path::new(&crate_dir).join("cbindgen.toml");
     let out_path = std::path::Path::new(&crate_dir).join("include/o3jc.h");
 
-    let config = cbindgen::Config::from_file(&config_path)
-        .expect("cbindgen.toml not found or invalid");
+    let config =
+        cbindgen::Config::from_file(&config_path).expect("cbindgen.toml not found or invalid");
 
     cbindgen::Builder::new()
         .with_crate(&crate_dir)

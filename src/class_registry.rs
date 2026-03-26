@@ -214,7 +214,9 @@ pub unsafe fn class_add_method(cls: Class, sel: SEL, imp: IMP, types: *const c_c
         // Pre-registration: mutate in place (no concurrent access possible).
         let list = cls_ref.method_list.get_or_insert_with(MethodList::new);
         // SAFETY: `list` is valid (just created or pre-existing) and not aliased here.
-        unsafe { list.as_mut() }.entries.push(MethodEntry { sel, types, imp });
+        unsafe { list.as_mut() }
+            .entries
+            .push(MethodEntry { sel, types, imp });
     }
 
     true

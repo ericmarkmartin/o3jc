@@ -54,17 +54,23 @@ pub type SEL = NonNull<ObjcSelector>;
 pub struct ObjcPtr(NonNull<ObjcObject>);
 
 impl Clone for ObjcPtr {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 impl Copy for ObjcPtr {}
 
 impl std::ops::Deref for ObjcPtr {
     type Target = NonNull<ObjcObject>;
-    fn deref(&self) -> &NonNull<ObjcObject> { &self.0 }
+    fn deref(&self) -> &NonNull<ObjcObject> {
+        &self.0
+    }
 }
 
 impl From<NonNull<ObjcObject>> for ObjcPtr {
-    fn from(ptr: NonNull<ObjcObject>) -> Self { Self(ptr) }
+    fn from(ptr: NonNull<ObjcObject>) -> Self {
+        Self(ptr)
+    }
 }
 
 // SAFETY: The runtime serializes all access to ObjC objects through

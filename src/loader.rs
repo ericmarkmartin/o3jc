@@ -67,35 +67,35 @@ pub struct ObjcModuleInfo {
 
     // __objc_selectors — array of { *name, *types } structs
     sel_start: *mut CompiledSelector,
-    sel_stop:  *mut CompiledSelector,
+    sel_stop: *mut CompiledSelector,
 
     // __objc_classes — array of pointers to class structs
     classes_start: *const *mut ObjcClass,
-    classes_stop:  *const *mut ObjcClass,
+    classes_stop: *const *mut ObjcClass,
 
     // __objc_class_refs (Phase 6+)
     class_refs_start: *const u8,
-    class_refs_stop:  *const u8,
+    class_refs_stop: *const u8,
 
     // __objc_cats (Phase 8)
     cats_start: *const u8,
-    cats_stop:  *const u8,
+    cats_stop: *const u8,
 
     // __objc_protocols (Phase 9)
     protocols_start: *const u8,
-    protocols_stop:  *const u8,
+    protocols_stop: *const u8,
 
     // __objc_protocol_refs (Phase 9)
     protocol_refs_start: *const u8,
-    protocol_refs_stop:  *const u8,
+    protocol_refs_stop: *const u8,
 
     // __objc_class_aliases
     class_aliases_start: *const u8,
-    class_aliases_stop:  *const u8,
+    class_aliases_stop: *const u8,
 
     // __objc_constant_string
     constant_strings_start: *const u8,
-    constant_strings_stop:  *const u8,
+    constant_strings_stop: *const u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,9 +186,7 @@ fn load_selectors(selectors: &mut [CompiledSelector]) {
 /// `compiled` must be null or point to a valid `CompiledMethodList` with
 /// `count` inline `CompiledMethodEntry` structs following the header.
 /// `load_selectors` must have already been called on this module.
-unsafe fn convert_method_list(
-    compiled: *const (),
-) -> Option<NonNull<MethodList>> {
+unsafe fn convert_method_list(compiled: *const ()) -> Option<NonNull<MethodList>> {
     if compiled.is_null() {
         return None;
     }
@@ -200,9 +198,9 @@ unsafe fn convert_method_list(
     }
 
     // The entries array starts right after the header.
-    let entries_start = unsafe {
-        (header as *const u8).add(std::mem::size_of::<CompiledMethodList>())
-    } as *const CompiledMethodEntry;
+    let entries_start =
+        unsafe { (header as *const u8).add(std::mem::size_of::<CompiledMethodList>()) }
+            as *const CompiledMethodEntry;
 
     // SAFETY: the compiled method list has `count` inline entries after the header.
     let compiled_entries = unsafe { std::slice::from_raw_parts(entries_start, count) };

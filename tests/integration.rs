@@ -158,3 +158,7 @@ fn subclass_inherits() { run_fixture("subclass_inherits", "1"); }
 
 #[test]
 fn method_swizzle() { run_fixture("method_swizzle", "1 0"); }
+
+// Phase 5: static class loading
+#[test]
+fn static_class() { run_fixture("static_class", "1"); }

@@ -14,17 +14,27 @@ pub struct ObjcObject {
 unsafe impl Send for ObjcObject {}
 unsafe impl Sync for ObjcObject {}
 
-/// Opaque selector handle — corresponds to GNUstep's `struct objc_selector`.
+/// Selector descriptor — corresponds to GNUstep's `struct objc_selector`.
 ///
-/// cbindgen:opaque
+/// In the GNUstep v2 ABI, selectors are pointers to `{ name, types }` pairs.
+/// The `name` field points to an interned C string (guaranteed unique per
+/// selector name by the intern table). Two selectors are equal iff their
+/// `name` pointers are equal.
 ///
-/// Never constructed directly; exists only as a pointee for `SEL`. The
-/// concrete representation (an interned C string address) is a runtime
-/// implementation detail invisible to Clang-compiled code.
+/// Compiled selectors (emitted by Clang into `__objc_selectors`) start with
+/// uninterned name pointers; the loader fixes them up at load time.
 #[repr(C)]
 pub struct ObjcSelector {
-    _private: [u8; 0],
+    /// Interned selector name (stable, process-lifetime pointer).
+    pub name: *const c_char,
+    /// Type encoding string, or null if untyped (e.g. from `sel_registerName`).
+    pub types: *const c_char,
 }
+
+// SAFETY: ObjcSelector fields are immutable after construction (or after
+// loader fixup). The name pointer is process-lifetime stable.
+unsafe impl Send for ObjcSelector {}
+unsafe impl Sync for ObjcSelector {}
 
 /// A selector — a non-null pointer to an interned `ObjcSelector`.
 ///
@@ -82,12 +92,14 @@ pub type IMP = unsafe extern "C" fn(Id, SEL, ...) -> Id;
 pub type Class = *mut ObjcClass;
 
 /// A single method descriptor stored in a method list.
+///
+/// Field order matches Clang's GNUstep v2 ABI: `{ IMP, SEL, types }`.
 #[repr(C)]
 pub struct MethodEntry {
+    pub imp: IMP,
     pub sel: SEL,
     /// Type-encoding string (e.g. `"v24@0:8"`), null-terminated.
     pub types: *const c_char,
-    pub imp: IMP,
 }
 
 // SAFETY: MethodEntry fields are only mutated under class-write locks.
@@ -122,48 +134,74 @@ impl MethodList {
 
 /// Class info flag bits.
 pub mod class_flags {
-    /// The class has been registered and is live in the class table.
-    pub const CLASS_REGISTERED: u64 = 1 << 0;
     /// This class object is a metaclass.
-    pub const CLASS_IS_METACLASS: u64 = 1 << 1;
+    /// Bit 0, matching Clang's GNUstep v2 codegen (`info = 1` for metaclass).
+    pub const CLASS_IS_METACLASS: u64 = 1 << 0;
+    /// The class has been registered and is live in the class table.
+    /// Runtime-internal flag at a high bit to avoid conflict with ABI flags.
+    pub const CLASS_REGISTERED: u64 = 1 << 16;
 }
 
-/// The runtime class object.
+/// The runtime class object — GNUstep v2 ABI layout (17 fields).
 ///
-/// The field layout here will eventually need to match what Clang emits for
-/// compiler-generated static classes (e.g. `@implementation MyClass`), but we
-/// haven't yet pinned down the exact GNUstep v2 layout. For now this is
-/// whatever the runtime needs internally.
+/// Field order matches exactly what Clang emits in `CGObjCGNU.cpp` for
+/// `-fobjc-runtime=gnustep-2.0`. This allows compiled class structs from
+/// `__objc_classes` to be used in-place without reallocation.
+///
+/// The method cache is stored in the `dtable` field (ABI field #9), which
+/// Clang always emits as null. Accessor methods abstract the cast.
 #[repr(C)]
 pub struct ObjcClass {
-    /// The metaclass (`isa` of the class object). `None` only for the root
-    /// metaclass (set during bootstrap).
+    // --- 17 ABI fields (must match Clang's CGObjCGNU.cpp exactly) ---
+    /// 1. The metaclass (`isa` of the class object). `None` only for the root
+    ///    metaclass before bootstrap.
     pub isa: Option<NonNull<ObjcClass>>,
-    /// The superclass; `None` for the root class.
+    /// 2. The superclass; `None` for the root class.
     pub super_class: Option<NonNull<ObjcClass>>,
-    /// Null-terminated class name. Heap-allocated; owned by this struct.
+    /// 3. Null-terminated class name.
     pub name: *const c_char,
-    /// Class version (default 0).
+    /// 4. Class version (default 0).
     pub version: i64,
-    /// Info flags (see `class_flags`).
+    /// 5. Info flags (see `class_flags`).
     pub info: u64,
-    /// Size of an instance in bytes.
+    /// 6. Size of an instance in bytes. Clang emits negative values for classes
+    ///    with ivars; the loader patches these at load time.
     pub instance_size: i64,
-    /// Ivar list — null until Phase 6.
+    /// 7. Ivar list — null until ivar support is implemented.
     pub ivars: *const (),
-    /// Head of the method list chain. `None` if no methods have been added yet.
+    /// 8. Head of the method list chain. `None` if no methods have been added.
     pub method_list: Option<NonNull<MethodList>>,
-    /// GNUstep dispatch table pointer. Null until we implement the dtable mechanism.
+    /// 9. Dispatch table pointer — repurposed to hold `*mut MethodCache`.
+    ///    Use `cache()` / `set_cache()` accessors instead of accessing directly.
     pub dtable: *const (),
-    /// Protocol list — null until Phase 5.
+    /// 10. C++ constructor function — null for plain ObjC classes.
+    pub cxx_construct: *const (),
+    /// 11. C++ destructor function — null for plain ObjC classes.
+    pub cxx_destruct: *const (),
+    /// 12. Head of the direct-subclass linked list, threaded through `sibling_class`.
+    pub subclass_list: Option<NonNull<ObjcClass>>,
+    /// 13. Next sibling in the parent's subclass list (`None` = end of list).
+    pub sibling_class: Option<NonNull<ObjcClass>>,
+    /// 14. Protocol conformance list — null until protocol support.
     pub protocols: *const (),
-    /// Head of the direct-subclass linked list, threaded through `next_sibling`.
-    /// Used to propagate cache invalidation down the hierarchy.
-    pub first_subclass: Option<NonNull<ObjcClass>>,
-    /// Next sibling in the parent's subclass list (`None` = end of list).
-    pub next_sibling: Option<NonNull<ObjcClass>>,
-    /// Per-class method cache. `None` until `objc_allocate_class_pair` initialises it.
-    pub cache: Option<NonNull<crate::method_cache::MethodCache>>,
+    /// 15. Extra reference data — null (reserved for future use).
+    pub extra_data: *const (),
+    /// 16. ABI version number.
+    pub abi_version: i64,
+    /// 17. Property metadata list — null until property support.
+    pub properties: *const (),
+}
+
+impl ObjcClass {
+    /// Read the per-class method cache stored in the `dtable` field.
+    pub fn cache(&self) -> Option<NonNull<crate::method_cache::MethodCache>> {
+        NonNull::new(self.dtable as *mut crate::method_cache::MethodCache)
+    }
+
+    /// Store a method cache pointer in the `dtable` field.
+    pub fn set_cache(&mut self, cache: Option<NonNull<crate::method_cache::MethodCache>>) {
+        self.dtable = cache.map_or(std::ptr::null(), |p| p.as_ptr() as *const ());
+    }
 }
 
 // SAFETY: The runtime owns all synchronization for class objects.

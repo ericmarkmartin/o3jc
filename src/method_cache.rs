@@ -16,6 +16,7 @@
 
 use parking_lot::RwLock;
 
+use crate::sel::sel_eq;
 use crate::types::{IMP, ObjcClass, SEL};
 
 // ---------------------------------------------------------------------------
@@ -43,14 +44,14 @@ impl CacheInner {
     fn lookup(&self, sel: SEL) -> Option<IMP> {
         self.entries
             .iter()
-            .find(|e| e.sel == sel)
+            .find(|e| sel_eq(e.sel, sel))
             .map(|e| e.imp)
     }
 
     fn insert(&mut self, sel: SEL, imp: IMP) {
         // Another thread may have inserted this sel while we waited for the
         // write lock; in that case the cached IMP is already correct.
-        if self.entries.iter().any(|e| e.sel == sel) {
+        if self.entries.iter().any(|e| sel_eq(e.sel, sel)) {
             return;
         }
         if self.entries.len() == self.entries.capacity() {
@@ -110,15 +111,15 @@ pub unsafe fn flush_class_cache_tree(cls: *mut ObjcClass) {
     }
     // SAFETY: caller guarantees `cls` is non-null and valid.
     let cls_ref = unsafe { &*cls };
-    if let Some(cache) = cls_ref.cache {
+    if let Some(cache) = cls_ref.cache() {
         // SAFETY: cache was allocated by `MethodCache::new` in `objc_allocate_class_pair`.
         unsafe { cache.as_ref().flush() };
     }
-    let mut sub = cls_ref.first_subclass;
+    let mut sub = cls_ref.subclass_list;
     while let Some(s) = sub {
         // SAFETY: subclass pointers are set in `objc_allocate_class_pair` and are valid
-        // for the process lifetime (classes are never freed in Phase 2).
+        // for the process lifetime (classes are never freed).
         unsafe { flush_class_cache_tree(s.as_ptr()) };
-        sub = unsafe { s.as_ref().next_sibling };
+        sub = unsafe { s.as_ref().sibling_class };
     }
 }

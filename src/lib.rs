@@ -20,7 +20,7 @@ pub use class_registry::{
 };
 pub use method_cache::MethodCache;
 pub use msg_send::class_lookup_method;
-pub use sel::{sel_get_name, sel_register_name_str};
+pub use sel::{intern_selector_name, sel_eq, sel_get_name, sel_register_name_str};
 pub use types::*;
 
 // ---------------------------------------------------------------------------

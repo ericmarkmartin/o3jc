@@ -183,12 +183,27 @@ All Phase 1–2 tests continue to pass, plus:
 | `tests/gnustep_runtime.h` | Standalone minimal GNUstep ABI header (types + function declarations). Avoids depending on a system-installed libobjc2 while remaining ABI-compatible. |
 | `tests/objc/*.m` | 13 ObjC fixture files — one per integration test case. Each is a standalone program that exercises the C ABI and prints results to stdout. |
 | `tests/integration.rs` | Rust integration test harness: 13 `#[test]` functions. Each compiles its `.m` fixture on demand (via `clang`), runs it, and asserts stdout. Only fixtures matching `cargo test`'s filter are compiled. |
+| `src/types.rs` (`ObjcPtr`) | `#[repr(transparent)]` newtype around `NonNull<ObjcObject>` with `Send + Sync`. Needed because `NonNull<T>` is unconditionally `!Send`, but `ShardedMutex<Id>` requires `Id: Send` for its `Sync` impl. `Id = Option<ObjcPtr>` preserves the null-pointer niche (ABI-compatible with `*mut ObjcObject`). |
+| `.github/workflows/ci.yml` | CI installs clang and builds the cdylib before `cargo test`; release job uploads `libo3jc.so` + `o3jc.h` on tag push. |
 
 ### C ABI exports (new in Phase 4)
 
 ```c
 void __objc_load(struct ObjcModuleInfo *info);   // GNUstep v2 module init hook
 ```
+
+### Weak reference refactor (Phase 4)
+
+Replaced hand-rolled `WEAK_LOCKS: [Mutex<()>; 8]` / `WeakLocation` / `ProxyGuard` (~70 lines) with `sharded_mutex` crate:
+
+| Before | After |
+|---|---|
+| `WEAK_LOCKS: [Mutex<()>; 8]` — 8 stripe locks | `ShardedMutex<Id, WeakSlotTag>` — 127 stripe locks from global pool |
+| `WeakLocation(AtomicPtr<Id>)` + `ProxyGuard<T>` — manual RAII guard, `unsafe` reads/writes | `ShardedMutexGuard` — `Deref`/`DerefMut` to `&mut Id`, plain `*guard = value` |
+| `Mutex<()>` protects nothing; data access via raw pointers | Mutex genuinely guards the data it protects |
+| `SmallVec<[WeakLocation; 0]>` with `AtomicPtr` for `Send + Sync` | `SmallVec<[WeakSlot; 0]>` — `WeakSlot` holds `&'static ShardedMutex<Id>` (auto `Send + Sync`) |
+
+Side table keyed by `usize` (object address cast to inert integer — never dereferenced through the key, avoids `Send`/`Sync` wrapper on the key).
 
 ### Tests passing (27 total via `cargo test`)
 
@@ -205,9 +220,52 @@ void __objc_load(struct ObjcModuleInfo *info);   // GNUstep v2 module init hook
 - **Null sentinels**: Clang always emits one null-initialised sentinel entry into each section (e.g. `{ i8*, i8* } zeroinitializer` for `__objc_selectors`). Phase 5's section walker must skip these.
 - **Standalone test header**: System libobjc2 is not available in this environment. `tests/gnustep_runtime.h` declares only the subset of `<objc/runtime.h>` + `<objc/objc-arc.h>` used by the integration tests, keeping each test self-contained.
 - **Rust integration harness**: `tests/integration.rs` compiles each `.m` fixture on demand via `std::process::Command` → `clang`. Only fixtures matching `cargo test`'s `--` filter are compiled, so `cargo test --test integration -- cache_hit` compiles and runs only `cache_hit.m`. Cargo's default thread pool parallelizes compilation of multiple fixtures.
+- **cbindgen limitation**: cbindgen's `Option<NonNull<T>>` → pointer resolution is hardcoded by name (`"NonNull"` string match in `simplified_type`). It can't see through our `ObjcPtr` wrapper. `cbindgen.toml` manually defines `typedef struct objc_object *Id;` and excludes `ObjcPtr`/`Option_ObjcPtr`/`Id` from auto-generation.
+- **`ObjcPtr` vs `NonNull`**: `NonNull<T>` is unconditionally `!Send + !Sync` regardless of `T`'s bounds. `ObjcPtr` adds `unsafe impl Send + Sync` justified by the runtime's lock-based serialization. This makes `Id: Send + Sync`, which propagates through `ShardedMutex<Id>`, `WeakSlot`, and `SideTableEntry` with no manual trait impls on any of those types.
 
 ---
 
-## Phases 5–13 — Not started
+## Phase 5 ✅ — Complete
+
+**Milestone:** Link and run a `.m` with static classes (no framework deps, explicit root)
+
+### What was built
+
+| File | Description |
+|---|---|
+| `src/types.rs` | `ObjcSelector` is now a real `{ name, types }` struct matching GNUstep v2 ABI. `MethodEntry` reordered to `{ imp, sel, types }` (IMP first). `ObjcClass` restructured to exact 17-field ABI layout; cache stored in `dtable` via accessor methods. `class_flags` swapped: `CLASS_IS_METACLASS` = bit 0 (matches Clang), `CLASS_REGISTERED` = bit 16 (runtime-internal). |
+| `src/sel.rs` | Split into `NAME_TABLE` (name string → interned `*const c_char`) and `SEL_TABLE` (name → leaked `ObjcSelector`). New `intern_selector_name` for loader use. New `sel_eq` for name-pointer comparison. |
+| `src/loader.rs` | Full `__objc_load` implementation: compiled ABI types (`CompiledSelector`, `CompiledMethodList`, `CompiledMethodEntry`), `load_selectors` (interns names, patches pointers), `convert_method_list` (compiled → runtime format), `load_classes` (patches instance_size, converts method lists, bootstraps root metaclass ISA, initializes caches, registers classes). |
+| `src/msg_send.rs` | `objc_msgSend`: x86_64 naked asm trampoline (saves all GPR + SSE arg registers, calls `objc_msg_lookup_nonnull`, restores, tail-calls IMP; nil receiver returns zero). `objc_msg_lookup_nonnull`: panics on miss. |
+| `src/class_registry.rs` | `register_loaded_class` for loader use. `ObjcClass` field renames: `first_subclass` → `subclass_list`, `next_sibling` → `sibling_class`. All 17 ABI fields initialized in `objc_allocate_class_pair`. |
+| `src/method_cache.rs` | Updated for field renames and `cache()` accessor. |
+| `tests/objc/static_class.m` | Phase 5 test fixture: root class with `@implementation`, class method `+hello`, dispatched via `[TestRoot hello]`. |
+
+### C ABI exports (new in Phase 5)
+
+```c
+IMP      objc_msg_lookup_nonnull(id receiver, SEL sel);  // non-nullable lookup
+void     objc_msgSend(id receiver, SEL sel, ...);        // x86_64 asm trampoline
+```
+
+### Tests passing (28 total via `cargo test`)
+
+14 Rust unit tests (phases 1–3) + 14 integration tests (13 from Phase 4 + 1 new):
+- `static_class` — Clang-compiled root class loaded from `__objc_classes`, class method dispatched via `objc_msgSend`
+
+### Key implementation notes
+
+- **SEL representation change**: `ObjcSelector` is now `{ name: *const c_char, types: *const c_char }` matching GNUstep v2 ABI. The intern table maps name strings to stable `*const c_char` pointers. Two SELs are equal iff `(*sel_a).name == (*sel_b).name` (interned name pointer equality). `sel_eq()` is used everywhere instead of direct pointer comparison on the SEL itself.
+- **Cache in dtable**: Compiled classes are exactly 17 fields. Rather than adding an 18th field and reallocating every compiled class, the method cache pointer is stored in the `dtable` field (ABI field #9, always null from Clang). `ObjcClass::cache()` / `set_cache()` accessors abstract the cast. This also matches libobjc2's approach where dtable IS the dispatch accelerator.
+- **Compiled classes used in-place**: No reallocation needed. The loader patches the compiled class struct directly: negates `instance_size` if negative, converts method lists, initializes cache in `dtable`, sets root metaclass ISA self-loop, and registers.
+- **Method list conversion**: Compiled method lists (`{ next, count: i32, size: i64, entries[] }`) have inline C arrays. The loader converts them to heap-allocated `MethodList { next, entries: Vec<MethodEntry> }` at load time, interning selectors from the already-fixedup `CompiledSelector` structs.
+- **Selector fixup**: `load_selectors` walks `__objc_selectors`, interns each name via `intern_selector_name`, and overwrites the `name` field with the interned pointer. Method list conversion then casts `*mut CompiledSelector` to `SEL` directly since `CompiledSelector` and `ObjcSelector` have identical layout.
+- **Root metaclass bootstrap**: Clang emits root metaclass with `isa = null`. The loader sets `metaclass.isa = Some(metaclass)` (self-loop) and `metaclass.super_class = Some(root_class)` for proper dispatch chain.
+- **`objc_msgSend` trampoline**: x86_64 naked asm function. Saves 6 GPRs (rdi–r9) + 8 SSE registers (xmm0–xmm7) = 176 bytes + 8 alignment = 184 bytes on stack. Calls `objc_msg_lookup_nonnull`, restores registers, and tail-calls the IMP via `jmp r11`. Nil receiver path returns zero in rax/rdx/xmm0/xmm1.
+- **Flag bit fix**: `CLASS_IS_METACLASS` moved to bit 0 (matching Clang's `info = 1` for metaclass). `CLASS_REGISTERED` moved to bit 16 to avoid conflict with any GNUstep ABI flags.
+
+---
+
+## Phases 6–13 — Not started
 
 See PLAN.md for full scope.

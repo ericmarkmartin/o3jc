@@ -124,11 +124,13 @@ static TABLE: LazyLock<DashMap<usize, SideTableEntry>> = LazyLock::new(DashMap::
 /// `obj` must be `None` or point to a live `ObjcObject`.
 pub unsafe fn objc_retain(obj: Id) -> Id {
     let obj = obj?;
-    let mut entry = TABLE.entry(obj.as_ptr() as usize).or_insert(SideTableEntry {
-        retain_count: 1,
-        deallocating: false,
-        weak_locations: SmallVec::new(),
-    });
+    let mut entry = TABLE
+        .entry(obj.as_ptr() as usize)
+        .or_insert(SideTableEntry {
+            retain_count: 1,
+            deallocating: false,
+            weak_locations: SmallVec::new(),
+        });
     if entry.deallocating {
         return None;
     }
@@ -180,7 +182,9 @@ pub unsafe fn objc_release(obj: Id) {
 /// Return the current retain count of `obj` (primarily for debugging).
 pub fn objc_retain_count(obj: Id) -> usize {
     let Some(obj) = obj else { return 0 };
-    TABLE.get(&(obj.as_ptr() as usize)).map_or(1, |e| e.retain_count)
+    TABLE
+        .get(&(obj.as_ptr() as usize))
+        .map_or(1, |e| e.retain_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,11 +255,13 @@ pub unsafe fn objc_store_weak(location: NonNull<Id>, new_obj: Id) -> Id {
     }
 
     if let Some(new_obj) = new_obj {
-        let mut entry = TABLE.entry(new_obj.as_ptr() as usize).or_insert(SideTableEntry {
-            retain_count: 1,
-            deallocating: false,
-            weak_locations: SmallVec::new(),
-        });
+        let mut entry = TABLE
+            .entry(new_obj.as_ptr() as usize)
+            .or_insert(SideTableEntry {
+                retain_count: 1,
+                deallocating: false,
+                weak_locations: SmallVec::new(),
+            });
         if entry.deallocating {
             *guard = None;
             return None;

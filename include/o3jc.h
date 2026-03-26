@@ -9,14 +9,16 @@ typedef struct objc_object *Id;
 
 
 /**
- * The class has been registered and is live in the class table.
+ * This class object is a metaclass.
+ * Bit 0, matching Clang's GNUstep v2 codegen (`info = 1` for metaclass).
  */
-#define CLASS_REGISTERED (1 << 0)
+#define CLASS_IS_METACLASS (1 << 0)
 
 /**
- * This class object is a metaclass.
+ * The class has been registered and is live in the class table.
+ * Runtime-internal flag at a high bit to avoid conflict with ABI flags.
  */
-#define CLASS_IS_METACLASS (1 << 1)
+#define CLASS_REGISTERED (1 << 16)
 
 typedef struct Vec_MethodEntry Vec_MethodEntry;
 
@@ -29,15 +31,25 @@ typedef struct objc_object {
 } objc_object;
 
 /**
- * Opaque selector handle — corresponds to GNUstep's `struct objc_selector`.
+ * Selector descriptor — corresponds to GNUstep's `struct objc_selector`.
  *
+ * In the GNUstep v2 ABI, selectors are pointers to `{ name, types }` pairs.
+ * The `name` field points to an interned C string (guaranteed unique per
+ * selector name by the intern table). Two selectors are equal iff their
+ * `name` pointers are equal.
  *
- * Never constructed directly; exists only as a pointee for `SEL`. The
- * concrete representation (an interned C string address) is a runtime
- * implementation detail invisible to Clang-compiled code.
+ * Compiled selectors (emitted by Clang into `__objc_selectors`) start with
+ * uninterned name pointers; the loader fixes them up at load time.
  */
 typedef struct objc_selector {
-  uint8_t _private[0];
+  /**
+   * Interned selector name (stable, process-lifetime pointer).
+   */
+  const char *name;
+  /**
+   * Type encoding string, or null if untyped (e.g. from `sel_registerName`).
+   */
+  const char *types;
 } objc_selector;
 
 /**
@@ -59,14 +71,16 @@ typedef Id (*IMP)(Id, SEL, ...);
 
 /**
  * A single method descriptor stored in a method list.
+ *
+ * Field order matches Clang's GNUstep v2 ABI: `{ IMP, SEL, types }`.
  */
 typedef struct objc_method {
+  IMP imp;
   SEL sel;
   /**
    * Type-encoding string (e.g. `"v24@0:8"`), null-terminated.
    */
   const char *types;
-  IMP imp;
 } objc_method;
 
 /**

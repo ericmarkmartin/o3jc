@@ -4,6 +4,7 @@ use std::ptr::NonNull;
 use std::sync::{LazyLock, RwLock};
 
 use crate::method_cache::{MethodCache, flush_class_cache_tree};
+use crate::sel::sel_eq;
 use crate::types::*;
 
 /// Newtype that lets `*mut ObjcClass` live in a `RwLock`-guarded map.
@@ -56,8 +57,11 @@ pub unsafe fn objc_allocate_class_pair(
         unsafe { (*superclass).isa }
     };
 
-    let metaclass = NonNull::from(Box::leak(Box::new(ObjcClass {
-        isa: None, // root metaclass isa — set during bootstrap (Phase 1: leave null)
+    let cache_meta = NonNull::from(Box::leak(MethodCache::new()));
+    let cache_cls = NonNull::from(Box::leak(MethodCache::new()));
+
+    let mut metaclass_obj = ObjcClass {
+        isa: None, // root metaclass isa — set during bootstrap
         super_class: meta_super,
         name: name_ptr,
         version: 0,
@@ -66,13 +70,19 @@ pub unsafe fn objc_allocate_class_pair(
         ivars: std::ptr::null(),
         method_list: None,
         dtable: std::ptr::null(),
+        cxx_construct: std::ptr::null(),
+        cxx_destruct: std::ptr::null(),
+        subclass_list: None,
+        sibling_class: None,
         protocols: std::ptr::null(),
-        first_subclass: None,
-        next_sibling: None,
-        cache: Some(NonNull::from(Box::leak(MethodCache::new()))),
-    })));
+        extra_data: std::ptr::null(),
+        abi_version: 0,
+        properties: std::ptr::null(),
+    };
+    metaclass_obj.set_cache(Some(cache_meta));
+    let metaclass = NonNull::from(Box::leak(Box::new(metaclass_obj)));
 
-    let class = NonNull::from(Box::leak(Box::new(ObjcClass {
+    let mut class_obj = ObjcClass {
         isa: Some(metaclass),
         super_class: NonNull::new(superclass),
         name: name_ptr,
@@ -82,20 +92,26 @@ pub unsafe fn objc_allocate_class_pair(
         ivars: std::ptr::null(),
         method_list: None,
         dtable: std::ptr::null(),
+        cxx_construct: std::ptr::null(),
+        cxx_destruct: std::ptr::null(),
+        subclass_list: None,
+        sibling_class: None,
         protocols: std::ptr::null(),
-        first_subclass: None,
-        next_sibling: None,
-        cache: Some(NonNull::from(Box::leak(MethodCache::new()))),
-    })));
+        extra_data: std::ptr::null(),
+        abi_version: 0,
+        properties: std::ptr::null(),
+    };
+    class_obj.set_cache(Some(cache_cls));
+    let class = NonNull::from(Box::leak(Box::new(class_obj)));
 
-    // Thread new class into the superclass's first_subclass / next_sibling list.
+    // Thread new class into the superclass's subclass_list / sibling_class list.
     if !superclass.is_null() {
         // SAFETY: caller guarantees `superclass` is a valid, live ObjcClass.
         let super_ref = unsafe { &mut *superclass };
-        let old_first = super_ref.first_subclass;
+        let old_first = super_ref.subclass_list;
         // SAFETY: `class` was just created above and is non-null.
-        unsafe { class.as_ptr().as_mut().unwrap().next_sibling = old_first };
-        super_ref.first_subclass = Some(class);
+        unsafe { class.as_ptr().as_mut().unwrap().sibling_class = old_first };
+        super_ref.subclass_list = Some(class);
     }
 
     class.as_ptr()
@@ -120,6 +136,27 @@ pub unsafe fn objc_register_class_pair(cls: Class) {
     registry.insert(name.into(), SendClass(cls));
     // SAFETY: caller guarantees `cls` points to a valid ObjcClass; write lock is held
     // so no concurrent access to `info`.
+    unsafe { (*cls).info |= class_flags::CLASS_REGISTERED };
+}
+
+/// Register a class that was loaded from a compiled binary (via `__objc_load`).
+///
+/// Unlike `objc_register_class_pair`, this does not wire subclass links
+/// (compiled classes may have them pre-set by Clang) and takes a raw pointer
+/// to a class that was not allocated by `objc_allocate_class_pair`.
+///
+/// # Safety
+/// `cls` must be non-null and point to a valid, fully-patched `ObjcClass`.
+pub unsafe fn register_loaded_class(cls: *mut ObjcClass) {
+    let name = {
+        // SAFETY: caller guarantees `cls` is valid; `name` is a Clang-emitted string.
+        unsafe { CStr::from_ptr((*cls).name) }
+            .to_str()
+            .expect("class name must be valid UTF-8")
+    };
+    let mut registry = CLASS_REGISTRY.write().unwrap();
+    registry.insert(name.into(), SendClass(cls));
+    // SAFETY: caller guarantees `cls` is valid; write lock is held.
     unsafe { (*cls).info |= class_flags::CLASS_REGISTERED };
 }
 
@@ -266,7 +303,7 @@ pub fn flush_all_caches() {
 unsafe fn method_exists_in_chain(head: Option<NonNull<MethodList>>, sel: SEL) -> bool {
     std::iter::successors(head, |&ptr| unsafe { ptr.as_ref().next })
         .flat_map(|ptr| unsafe { ptr.as_ref() }.entries.iter())
-        .any(|e| e.sel == sel)
+        .any(|e| sel_eq(e.sel, sel))
 }
 
 /// Return a raw pointer to the first `MethodEntry` with selector `sel` in the
@@ -284,7 +321,7 @@ unsafe fn find_method_in_chain(
             .iter()
             // SAFETY: entries live in a heap-allocated Vec that is stable (not
             // reallocated) after the class is registered.
-            .find(|e| e.sel == sel)
+            .find(|e| sel_eq(e.sel, sel))
             .map(|e| e as *const MethodEntry as *mut MethodEntry)
     })
 }

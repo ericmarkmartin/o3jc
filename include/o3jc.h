@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 typedef struct objc_class objc_class;
+typedef struct objc_selector objc_selector;
 typedef struct objc_object *Id;
 
 
@@ -31,35 +32,13 @@ typedef struct objc_object {
 } objc_object;
 
 /**
- * Selector descriptor — corresponds to GNUstep's `struct objc_selector`.
- *
- * In the GNUstep v2 ABI, selectors are pointers to `{ name, types }` pairs.
- * The `name` field points to an interned C string (guaranteed unique per
- * selector name by the intern table). Two selectors are equal iff their
- * `name` pointers are equal.
- *
- * Compiled selectors (emitted by Clang into `__objc_selectors`) start with
- * uninterned name pointers; the loader fixes them up at load time.
- */
-typedef struct objc_selector {
-  /**
-   * Interned selector name (stable, process-lifetime pointer).
-   */
-  const char *name;
-  /**
-   * Type encoding string, or null if untyped (e.g. from `sel_registerName`).
-   */
-  const char *types;
-} objc_selector;
-
-/**
  * A selector — a non-null pointer to an interned `ObjcSelector`.
  *
  * Two selectors are equal iff their pointer values are equal (guaranteed by
  * the intern table in `sel.rs`). Nullable selectors at call boundaries are
  * expressed as `Option<SEL>`.
  */
-typedef struct objc_selector *SEL;
+typedef objc_selector *SEL;
 
 /**
  * A method implementation.

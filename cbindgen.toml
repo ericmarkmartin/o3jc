@@ -7,15 +7,15 @@ include_version = true
 # `Send + Sync`).  We suppress the opaque struct and provide the correct typedef.
 after_includes = """
 typedef struct objc_class objc_class;
+typedef struct objc_selector objc_selector;
 typedef struct objc_object *Id;
 """
 
 [export]
-# Export the public ABI types. ObjcClass and ObjcClassAbi are excluded:
-# struct objc_class is opaque in the GNUstep public header and our internal
-# layout is not part of the public interface.
-include = ["ObjcObject", "ObjcSelector", "MethodEntry", "MethodList"]
-exclude = ["ObjcClass", "ObjcClassAbi", "ObjcPtr", "Option_ObjcPtr", "Id"]
+# Export the public ABI types. Opaque types (ObjcClass, ObjcSelector) are
+# forward-declared in after_includes — their internal layout is not public.
+include = ["ObjcObject", "MethodEntry", "MethodList"]
+exclude = ["ObjcClass", "ObjcClassAbi", "ObjcSelector", "ObjcPtr", "Option_ObjcPtr", "Id"]
 
 [export.rename]
 "ObjcObject" = "objc_object"

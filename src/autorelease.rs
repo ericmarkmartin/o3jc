@@ -12,12 +12,13 @@
 use std::cell::RefCell;
 
 use crate::retain_release::objc_release;
-use crate::types::Id;
+use crate::types::{Id, ObjcPtr};
 
 thread_local! {
     /// Stack of pools. Each inner `Vec` holds the objects autoreleased into
-    /// that pool in the order they were added.
-    static POOL_STACK: RefCell<Vec<Vec<Id>>> = const { RefCell::new(Vec::new()) };
+    /// that pool in the order they were added. Objects are always non-null
+    /// (`objc_autorelease` early-returns on nil).
+    static POOL_STACK: RefCell<Vec<Vec<ObjcPtr>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Push a new autorelease pool onto the current thread's pool stack.
@@ -48,8 +49,8 @@ pub unsafe fn objc_autorelease_pool_pop(token: *mut ()) {
             if let Some(pool) = stack.pop() {
                 for obj in pool.into_iter().rev() {
                     // SAFETY: objects were live when added to the pool and
-                    // `objc_autorelease` guarantees they are valid Id values.
-                    unsafe { objc_release(obj) };
+                    // `objc_autorelease` guarantees they are valid ObjcPtr values.
+                    unsafe { objc_release(Some(obj)) };
                 }
             }
         }
@@ -63,13 +64,11 @@ pub unsafe fn objc_autorelease_pool_pop(token: *mut ()) {
 /// # Safety
 /// `obj` must be null or point to a live `ObjcObject`.
 pub unsafe fn objc_autorelease(obj: Id) -> Id {
-    if obj.is_none() {
-        return obj;
-    }
+    let ptr = obj?;
     POOL_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         if let Some(pool) = stack.last_mut() {
-            pool.push(obj);
+            pool.push(ptr);
         }
     });
     obj

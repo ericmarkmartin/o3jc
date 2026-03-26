@@ -6,42 +6,41 @@ use dashmap::DashMap;
 
 use crate::types::{ObjcSelector, SEL};
 
-/// Maps canonical name → interned `*const c_char` (stored as usize for `Send`).
-/// Each name string is leaked via `CString::into_raw` for process-lifetime stability.
-static NAME_TABLE: LazyLock<DashMap<Box<str>, usize>> = LazyLock::new(DashMap::new);
+/// Maps canonical name → interned `&'static CStr`.
+/// Each name string is leaked via `Box::leak` for process-lifetime stability.
+static NAME_TABLE: LazyLock<DashMap<Box<str>, &'static CStr>> = LazyLock::new(DashMap::new);
 
-/// Maps canonical name → leaked `*mut ObjcSelector` (stored as usize for `Send`).
+/// Maps canonical name → leaked `&'static ObjcSelector`.
 /// Deduplicates selectors created by `sel_registerName` (which have no types).
-static SEL_TABLE: LazyLock<DashMap<Box<str>, usize>> = LazyLock::new(DashMap::new);
+static SEL_TABLE: LazyLock<DashMap<Box<str>, &'static ObjcSelector>> = LazyLock::new(DashMap::new);
 
-/// Intern a selector name string and return a stable `*const c_char` pointer.
+/// Intern a selector name string and return a stable `NonNull<c_char>` pointer.
 ///
 /// Guaranteed: calling this function twice with equal strings returns the
 /// same pointer value. Used by both `sel_register_name_str` and the loader's
 /// selector fixup.
-pub fn intern_selector_name(name: &str) -> *const c_char {
-    let addr = *NAME_TABLE.entry(name.into()).or_insert_with(|| {
+pub fn intern_selector_name(name: &str) -> NonNull<c_char> {
+    let cstr: &'static CStr = *NAME_TABLE.entry(name.into()).or_insert_with(|| {
         let cs = CString::new(name).expect("selector name must not contain interior NULs");
-        cs.into_raw() as usize
+        Box::leak(cs.into_boxed_c_str())
     });
-    addr as *const c_char
+    // SAFETY: `CStr::as_ptr()` always returns a non-null pointer.
+    unsafe { NonNull::new_unchecked(cstr.as_ptr().cast_mut()) }
 }
 
 /// Return (or create) the unique selector for the Rust string `name`.
 ///
-/// The returned SEL has `types == null` (untyped). Two calls with the same
+/// The returned SEL has `types == None` (untyped). Two calls with the same
 /// string return the same `NonNull<ObjcSelector>` pointer.
 pub fn sel_register_name_str(name: &str) -> SEL {
-    let addr = *SEL_TABLE.entry(name.into()).or_insert_with(|| {
+    let sel_ref: &'static ObjcSelector = *SEL_TABLE.entry(name.into()).or_insert_with(|| {
         let name_ptr = intern_selector_name(name);
-        let sel = Box::new(ObjcSelector {
+        Box::leak(Box::new(ObjcSelector {
             name: name_ptr,
-            types: std::ptr::null(),
-        });
-        Box::into_raw(sel) as usize
+            types: None,
+        }))
     });
-    // SAFETY: `addr` is from `Box::into_raw`, always non-null.
-    unsafe { NonNull::new_unchecked(addr as *mut ObjcSelector) }
+    NonNull::from(sel_ref)
 }
 
 /// C-ABI entry point: intern `name` (a null-terminated C string) as a selector.
@@ -59,7 +58,7 @@ pub fn sel_get_name(sel: SEL) -> *const c_char {
     // SAFETY: every SEL points to a valid ObjcSelector whose `name` field
     // is either an interned CString (from sel_register_name_str) or a
     // loader-fixedup pointer (from __objc_selectors).
-    unsafe { (*sel.as_ptr()).name }
+    unsafe { (*sel.as_ptr()).name.as_ptr() }
 }
 
 /// Compare two selectors for name equality.

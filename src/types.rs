@@ -25,10 +25,33 @@ unsafe impl Sync for ObjcObject {}
 /// uninterned name pointers; the loader fixes them up at load time.
 #[repr(C)]
 pub struct ObjcSelector {
-    /// Interned selector name (stable, process-lifetime pointer).
-    pub name: *const c_char,
-    /// Type encoding string, or null if untyped (e.g. from `sel_registerName`).
-    pub types: *const c_char,
+    /// Interned selector name (stable, process-lifetime pointer). Always
+    /// non-null after construction or loader fixup.
+    pub(crate) name: NonNull<c_char>,
+    /// Type encoding string, or `None` if untyped (e.g. from `sel_registerName`).
+    /// `Option<NonNull<c_char>>` is ABI-compatible with a nullable `*const c_char`.
+    pub(crate) types: Option<NonNull<c_char>>,
+}
+
+impl ObjcSelector {
+    /// The interned selector name as a `&CStr`.
+    ///
+    /// # Safety
+    /// The `name` pointer must point to a valid, null-terminated C string
+    /// that lives for at least as long as the returned reference.
+    pub unsafe fn name(&self) -> &std::ffi::CStr {
+        unsafe { std::ffi::CStr::from_ptr(self.name.as_ptr()) }
+    }
+
+    /// The type encoding string, or `None` if this is an untyped selector.
+    ///
+    /// # Safety
+    /// The `types` pointer (if present) must point to a valid, null-terminated
+    /// C string that lives for at least as long as the returned reference.
+    pub unsafe fn types(&self) -> Option<&std::ffi::CStr> {
+        self.types
+            .map(|ptr| unsafe { std::ffi::CStr::from_ptr(ptr.as_ptr()) })
+    }
 }
 
 // SAFETY: ObjcSelector fields are immutable after construction (or after

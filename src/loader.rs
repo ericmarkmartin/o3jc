@@ -32,6 +32,17 @@ pub struct CompiledSelector {
     types: *const c_char,
 }
 
+const _: () = {
+    assert!(
+        std::mem::size_of::<CompiledSelector>() == std::mem::size_of::<ObjcSelector>(),
+        "CompiledSelector and ObjcSelector must have the same size"
+    );
+    assert!(
+        std::mem::align_of::<CompiledSelector>() == std::mem::align_of::<ObjcSelector>(),
+        "CompiledSelector and ObjcSelector must have the same alignment"
+    );
+};
+
 /// Header of a compiled method list: `{ next, count, size, entries[] }`.
 ///
 /// The `next` field is always null from the compiler; the runtime may use it
@@ -166,7 +177,7 @@ fn load_selectors(selectors: &mut [CompiledSelector]) {
             .expect("selector name must be valid UTF-8");
         let interned = intern_selector_name(name_str);
         // Overwrite the name pointer with the interned version.
-        entry.name = interned;
+        entry.name = interned.as_ptr();
     }
 }
 

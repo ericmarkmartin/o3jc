@@ -266,6 +266,33 @@ void     objc_msgSend(id receiver, SEL sel, ...);        // x86_64 asm trampolin
 
 ---
 
-## Phases 6–13 — Not started
+## Phase 6 ✅ — Complete
+
+**Milestone:** Static class hierarchies — inherited method dispatch through compiled superclass chain
+
+### What was built
+
+| File | Description |
+|---|---|
+| `src/loader.rs` | Full metaclass chain fixup in `load_classes`: root metaclass gets ISA self-loop + super → root class; non-root metaclass gets ISA → root metaclass + super → superclass's metaclass. Subclass list threading for cache invalidation (class and metaclass). |
+| `tests/objc/static_hierarchy.m` | Phase 6 test fixture: two-class hierarchy (`Root` + `Child : Root`), tests inherited class method dispatch, own method dispatch, and direct dispatch on root. |
+| `tests/integration.rs` | `static_hierarchy` integration test. |
+
+### Tests passing (29 total via `cargo test`)
+
+14 Rust unit tests (phases 1–3) + 15 integration tests (14 from phases 4–5 + 1 new):
+- `static_hierarchy` — Clang-compiled class hierarchy loaded; `[Child rootMethod]` dispatches inherited class method through metaclass superclass chain
+
+### Key implementation notes
+
+- **Clang emits ALL metaclasses with `isa = null` and `super_class = null`**: The GNUstep v2 ABI (at least with Clang 14) does not resolve metaclass chain pointers at link time. The runtime must fix up the entire metaclass chain at load time. This was the main discovery — the Phase 5 code only handled root metaclasses, silently setting every metaclass's ISA to a self-loop.
+- **Metaclass fixup logic**: For root classes (`super_class == None`): metaclass ISA = self (self-loop), metaclass super = root class. For non-root classes: metaclass super = superclass's metaclass (`super_class.isa`), metaclass ISA = root metaclass (found by walking the superclass chain to the root and reading its `isa`).
+- **Order-independent**: The fixup works regardless of class processing order in `__objc_classes`. Class `super_class` pointers are linker-resolved (always valid), so the superclass chain can be walked even if the superclass hasn't been patched yet. The root class's `isa` (pointing to the root metaclass struct) is also linker-set.
+- **Subclass list threading**: Both classes and metaclasses are wired into their respective superclass's `subclass_list`/`sibling_class` linked list, enabling `flush_class_cache_tree` to propagate cache invalidation through compiled hierarchies. Root metaclass → root class wiring is skipped (that relationship is for method fallback, not hierarchy).
+- **No changes to dispatch code**: `class_lookup_method` in `msg_send.rs` already walks `super_class` via `std::iter::successors`. Once the metaclass chain is correctly fixed up, inherited method dispatch works without any dispatch-side changes.
+
+---
+
+## Phases 7–13 — Not started
 
 See PLAN.md for full scope.

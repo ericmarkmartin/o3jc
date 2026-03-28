@@ -193,3 +193,9 @@ fn method_swizzle() {
 fn static_class() {
     run_fixture("static_class", "1");
 }
+
+// Phase 6: static class hierarchies
+#[test]
+fn static_hierarchy() {
+    run_fixture("static_hierarchy", "1\n2\n1");
+}

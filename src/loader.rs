@@ -284,18 +284,66 @@ unsafe fn load_classes(class_ptrs: &[*mut ObjcClass]) {
         unsafe { patch_class(cls) };
 
         // Process the metaclass (pointed to by isa).
+        //
+        // Clang emits ALL metaclasses with isa = null and super_class = null.
+        // The runtime must fix up the full metaclass chain:
+        //   - Root metaclass: isa = self (self-loop), super = root class
+        //   - Non-root metaclass: isa = root metaclass, super = superclass's metaclass
         if let Some(meta_nn) = cls.isa {
             let meta = unsafe { meta_nn.as_ptr().as_mut().unwrap() };
             unsafe { patch_class(meta) };
 
-            // Root metaclass ISA: self-loop (metaclass.isa = metaclass).
-            if meta.isa.is_none() {
-                meta.isa = Some(meta_nn);
-            }
+            if let Some(super_nn) = cls.super_class {
+                // Non-root class: set metaclass super to superclass's metaclass.
+                // SAFETY: super_class is a valid linker-resolved pointer.
+                let super_meta = unsafe { super_nn.as_ref().isa };
+                meta.super_class = super_meta;
 
-            // Root metaclass super_class → root class.
-            if meta.super_class.is_none() && cls.super_class.is_none() {
+                // Set metaclass ISA to root metaclass.
+                // Walk the superclass chain to find the root class.
+                let mut cur = cls.super_class;
+                while let Some(c) = cur {
+                    // SAFETY: all super_class pointers are linker-resolved.
+                    let next = unsafe { c.as_ref().super_class };
+                    if next.is_none() {
+                        // Found root class; its isa is the root metaclass.
+                        meta.isa = unsafe { c.as_ref().isa };
+                        break;
+                    }
+                    cur = next;
+                }
+            } else {
+                // Root class: metaclass ISA self-loop, super → root class.
+                meta.isa = Some(meta_nn);
                 meta.super_class = Some(cls_nn);
+            }
+        }
+
+        // Wire class into superclass's subclass list for cache invalidation.
+        if let Some(super_nn) = cls.super_class {
+            // SAFETY: super_class is a valid pointer resolved by the dynamic linker.
+            let super_ref = unsafe { &mut *super_nn.as_ptr() };
+            cls.sibling_class = super_ref.subclass_list;
+            super_ref.subclass_list = Some(cls_nn);
+        }
+
+        // Wire metaclass into its superclass's subclass list too.
+        if let Some(meta_nn) = cls.isa {
+            // SAFETY: isa is a valid pointer to the metaclass.
+            let meta = unsafe { &mut *meta_nn.as_ptr() };
+            if let Some(meta_super_nn) = meta.super_class {
+                // Skip wiring root metaclass into root class's subclass list —
+                // that relationship (root metaclass super = root class) is for
+                // method fallback, not class hierarchy.
+                let meta_super = unsafe { &*meta_super_nn.as_ptr() };
+                let is_root_meta_to_root_class = cls.super_class.is_none()
+                    && meta_super.info & class_flags::CLASS_IS_METACLASS == 0;
+                if !is_root_meta_to_root_class {
+                    // SAFETY: metaclass super_class was set above during fixup.
+                    let meta_super = unsafe { &mut *meta_super_nn.as_ptr() };
+                    meta.sibling_class = meta_super.subclass_list;
+                    meta_super.subclass_list = Some(meta_nn);
+                }
             }
         }
 

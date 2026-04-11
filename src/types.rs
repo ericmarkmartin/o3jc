@@ -236,3 +236,109 @@ impl ObjcClass {
 // SAFETY: The runtime owns all synchronization for class objects.
 unsafe impl Send for ObjcClass {}
 unsafe impl Sync for ObjcClass {}
+
+/// A read-only reference to a live `ObjcClass`.
+///
+/// Concentrates the pointer-validity unsafe at construction time so that
+/// traversal of class hierarchies (superclass chain, subclass tree,
+/// method-list chain) can be done with safe code.
+///
+/// # Invariant
+/// The inner pointer is non-null and points to a valid `ObjcClass`.
+/// In practice, classes are allocated via `Box::leak` or loaded from
+/// compiled binaries and never freed, so the pointer is valid for the
+/// process lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassRef(NonNull<ObjcClass>);
+
+impl ClassRef {
+    /// Wrap a raw `NonNull` class pointer.
+    ///
+    /// # Safety
+    /// `ptr` must point to a valid, live `ObjcClass`.
+    pub unsafe fn from_raw(ptr: NonNull<ObjcClass>) -> Self {
+        Self(ptr)
+    }
+
+    /// Wrap a raw `*mut ObjcClass` pointer.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and point to a valid, live `ObjcClass`.
+    pub unsafe fn from_ptr(ptr: *mut ObjcClass) -> Self {
+        unsafe { Self(NonNull::new_unchecked(ptr)) }
+    }
+
+    /// The raw mutable pointer.
+    pub fn as_ptr(self) -> *mut ObjcClass {
+        self.0.as_ptr()
+    }
+
+    /// The raw `NonNull` pointer.
+    pub fn as_non_null(self) -> NonNull<ObjcClass> {
+        self.0
+    }
+
+    /// The metaclass (isa).
+    pub fn isa(self) -> Option<ClassRef> {
+        // SAFETY: ClassRef invariant guarantees the pointer is valid.
+        unsafe { self.0.as_ref().isa.map(ClassRef) }
+    }
+
+    /// The superclass, or `None` for root classes.
+    pub fn superclass(self) -> Option<ClassRef> {
+        // SAFETY: ClassRef invariant.
+        unsafe { self.0.as_ref().super_class.map(ClassRef) }
+    }
+
+    /// The head of the method-list chain.
+    pub fn method_list(self) -> Option<NonNull<MethodList>> {
+        // SAFETY: ClassRef invariant.
+        unsafe { self.0.as_ref().method_list }
+    }
+
+    /// The per-class method cache.
+    pub fn cache(&self) -> Option<&crate::method_cache::MethodCache> {
+        // SAFETY: ClassRef invariant; cache allocated via Box::leak (process-lifetime).
+        unsafe { self.0.as_ref().cache().map(|p| p.as_ref()) }
+    }
+
+    /// Head of the direct-subclass linked list.
+    pub fn subclass_list(self) -> Option<ClassRef> {
+        // SAFETY: ClassRef invariant.
+        unsafe { self.0.as_ref().subclass_list.map(ClassRef) }
+    }
+
+    /// Next sibling in the parent's subclass list.
+    pub fn sibling_class(self) -> Option<ClassRef> {
+        // SAFETY: ClassRef invariant.
+        unsafe { self.0.as_ref().sibling_class.map(ClassRef) }
+    }
+
+    /// Iterator over the class hierarchy (self, superclass, superclass's super, …).
+    pub fn ancestors(self) -> impl Iterator<Item = ClassRef> {
+        std::iter::successors(Some(self), |cls| cls.superclass())
+    }
+
+    /// Iterator over direct subclasses.
+    pub fn subclasses(self) -> impl Iterator<Item = ClassRef> {
+        std::iter::successors(self.subclass_list(), |cls| cls.sibling_class())
+    }
+}
+
+/// Iterate over a linked chain of `MethodList` nodes.
+///
+/// All method-list nodes are allocated via `Box::leak` and never freed,
+/// so the returned references are valid for the process lifetime.
+pub fn method_list_iter(
+    head: Option<NonNull<MethodList>>,
+) -> impl Iterator<Item = &'static MethodList> {
+    std::iter::successors(head, |&ptr| {
+        // SAFETY: all MethodList nodes are process-lifetime-stable (Box::leak).
+        let list: &MethodList = unsafe { &*ptr.as_ptr() };
+        list.next
+    })
+    .map(|ptr| -> &'static MethodList {
+        // SAFETY: same guarantee.
+        unsafe { &*ptr.as_ptr() }
+    })
+}

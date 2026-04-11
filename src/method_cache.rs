@@ -17,7 +17,7 @@
 use parking_lot::RwLock;
 
 use crate::sel::sel_eq;
-use crate::types::{IMP, ObjcClass, SEL};
+use crate::types::{ClassRef, IMP, SEL};
 
 // ---------------------------------------------------------------------------
 // Inner list
@@ -101,25 +101,11 @@ impl MethodCache {
 // Cache-tree helpers
 
 /// Flush the method cache of `cls` and recursively all of its subclasses.
-///
-/// # Safety
-/// `cls` must be null or point to a live `ObjcClass`. All pointers reachable
-/// via `first_subclass` / `next_sibling` must also be valid.
-pub unsafe fn flush_class_cache_tree(cls: *mut ObjcClass) {
-    if cls.is_null() {
-        return;
+pub fn flush_class_cache_tree(cls: ClassRef) {
+    if let Some(cache) = cls.cache() {
+        cache.flush();
     }
-    // SAFETY: caller guarantees `cls` is non-null and valid.
-    let cls_ref = unsafe { &*cls };
-    if let Some(cache) = cls_ref.cache() {
-        // SAFETY: cache was allocated by `MethodCache::new` in `objc_allocate_class_pair`.
-        unsafe { cache.as_ref().flush() };
-    }
-    let mut sub = cls_ref.subclass_list;
-    while let Some(s) = sub {
-        // SAFETY: subclass pointers are set in `objc_allocate_class_pair` and are valid
-        // for the process lifetime (classes are never freed).
-        unsafe { flush_class_cache_tree(s.as_ptr()) };
-        sub = unsafe { s.as_ref().sibling_class };
+    for sub in cls.subclasses() {
+        flush_class_cache_tree(sub);
     }
 }

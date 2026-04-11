@@ -53,12 +53,21 @@ pub unsafe fn sel_register_name_cstr(name: *const c_char) -> SEL {
     sel_register_name_str(&s)
 }
 
+/// Return the interned name pointer of a selector.
+///
+/// Safe because all SELs point to process-lifetime-stable `ObjcSelector`
+/// structs, allocated by the intern table or patched by the loader.
+fn sel_name_ptr(sel: SEL) -> NonNull<c_char> {
+    // SAFETY: All SELs are constructed by `sel_register_name_str` (which
+    // leaks via `Box::leak`) or by the loader's selector fixup (which
+    // patches Clang-emitted structs in `__objc_selectors`). Both paths
+    // guarantee the `ObjcSelector` is valid for the process lifetime.
+    unsafe { sel.as_ref().name }
+}
+
 /// Return the interned name of a selector as a C string pointer.
 pub fn sel_get_name(sel: SEL) -> *const c_char {
-    // SAFETY: every SEL points to a valid ObjcSelector whose `name` field
-    // is either an interned CString (from sel_register_name_str) or a
-    // loader-fixedup pointer (from __objc_selectors).
-    unsafe { (*sel.as_ptr()).name.as_ptr() }
+    sel_name_ptr(sel).as_ptr()
 }
 
 /// Compare two selectors for name equality.
@@ -68,6 +77,5 @@ pub fn sel_get_name(sel: SEL) -> *const c_char {
 /// GNUstep v2 ABI where different typed selectors with the same name share
 /// the same interned name pointer.
 pub fn sel_eq(a: SEL, b: SEL) -> bool {
-    // SAFETY: both SELs point to valid ObjcSelector structs.
-    unsafe { (*a.as_ptr()).name == (*b.as_ptr()).name }
+    sel_name_ptr(a) == sel_name_ptr(b)
 }

@@ -191,7 +191,7 @@ pub unsafe fn class_add_method(cls: Class, sel: SEL, imp: IMP, types: *const c_c
     let cls_ref = unsafe { &mut *cls };
 
     // Reject duplicate selectors (walk the entire method list chain).
-    if unsafe { method_exists_in_chain(cls_ref.method_list, sel) } {
+    if method_exists_in_chain(cls_ref.method_list, sel) {
         return false;
     }
 
@@ -209,7 +209,7 @@ pub unsafe fn class_add_method(cls: Class, sel: SEL, imp: IMP, types: *const c_c
 
         // Flush the cache for this class and all subclasses.
         // SAFETY: `cls` is a valid, live ObjcClass (caller contract).
-        unsafe { flush_class_cache_tree(cls) };
+        flush_class_cache_tree(unsafe { ClassRef::from_ptr(cls) });
     } else {
         // Pre-registration: mutate in place (no concurrent access possible).
         let list = cls_ref.method_list.get_or_insert_with(MethodList::new);
@@ -236,13 +236,12 @@ pub unsafe fn class_replace_method(
 ) -> Option<IMP> {
     // SAFETY: caller guarantees `cls` is non-null and valid.
     let cls_ref = unsafe { &mut *cls };
-    if let Some(entry) =
-        unsafe { find_method_in_chain(cls_ref.method_list, sel) }.map(|p| unsafe { &mut *p })
+    if let Some(entry) = find_method_in_chain(cls_ref.method_list, sel).map(|p| unsafe { &mut *p })
     {
         let old = entry.imp;
         entry.imp = imp;
         // SAFETY: `cls` is valid.
-        unsafe { flush_class_cache_tree(cls) };
+        flush_class_cache_tree(unsafe { ClassRef::from_ptr(cls) });
         Some(old)
     } else {
         // SAFETY: forwarding our own safety requirements.
@@ -281,8 +280,8 @@ pub unsafe fn class_get_instance_method(cls: Class, sel: SEL) -> *mut MethodEntr
         return std::ptr::null_mut();
     }
     // SAFETY: caller guarantees `cls` is non-null and valid.
-    let method_list = unsafe { (*cls).method_list };
-    unsafe { find_method_in_chain(method_list, sel) }.unwrap_or(std::ptr::null_mut())
+    let cls_ref = unsafe { ClassRef::from_ptr(cls) };
+    find_method_in_chain(cls_ref.method_list(), sel).unwrap_or(std::ptr::null_mut())
 }
 
 /// Flush the caches of every class currently in the registry (and their subclasses).
@@ -290,7 +289,7 @@ pub fn flush_all_caches() {
     let registry = CLASS_REGISTRY.read().unwrap();
     for send_class in registry.values() {
         // SAFETY: registered class pointers are valid for the process lifetime.
-        unsafe { flush_class_cache_tree(send_class.0) };
+        flush_class_cache_tree(unsafe { ClassRef::from_ptr(send_class.0) });
     }
 }
 
@@ -299,30 +298,18 @@ pub fn flush_all_caches() {
 
 /// Return `true` if any node in the method list chain rooted at `head`
 /// contains an entry with selector `sel`.
-///
-/// # Safety
-/// `head` and all `next` pointers must be valid `MethodList` references.
-unsafe fn method_exists_in_chain(head: Option<NonNull<MethodList>>, sel: SEL) -> bool {
-    std::iter::successors(head, |&ptr| unsafe { ptr.as_ref().next })
-        .flat_map(|ptr| unsafe { ptr.as_ref() }.entries.iter())
+fn method_exists_in_chain(head: Option<NonNull<MethodList>>, sel: SEL) -> bool {
+    method_list_iter(head)
+        .flat_map(|list| list.entries.iter())
         .any(|e| sel_eq(e.sel, sel))
 }
 
 /// Return a raw pointer to the first `MethodEntry` with selector `sel` in the
 /// method list chain rooted at `head`, or `None` if not found.
-///
-/// # Safety
-/// `head` and all `next` pointers must be valid `MethodList` references.
-unsafe fn find_method_in_chain(
-    head: Option<NonNull<MethodList>>,
-    sel: SEL,
-) -> Option<*mut MethodEntry> {
-    std::iter::successors(head, |&ptr| unsafe { ptr.as_ref().next }).find_map(|ptr| {
-        unsafe { ptr.as_ref() }
-            .entries
+fn find_method_in_chain(head: Option<NonNull<MethodList>>, sel: SEL) -> Option<*mut MethodEntry> {
+    method_list_iter(head).find_map(|list| {
+        list.entries
             .iter()
-            // SAFETY: entries live in a heap-allocated Vec that is stable (not
-            // reallocated) after the class is registered.
             .find(|e| sel_eq(e.sel, sel))
             .map(|e| e as *const MethodEntry as *mut MethodEntry)
     })

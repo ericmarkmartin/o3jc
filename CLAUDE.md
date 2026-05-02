@@ -15,6 +15,22 @@ Always read these at the start of a session:
 Check `docs/ideas/` for design explorations that were considered and parked. These often
 contain useful context about tradeoffs relevant to upcoming phases.
 
+## Unsafe Discipline
+
+Minimize `unsafe` in internal code. Concentrate pointer-validity invariants at
+construction boundaries using safe wrapper types (`ClassRef`, `method_list_iter`,
+`sel_name_ptr`, etc.), so that traversal and business logic is safe Rust.
+
+- **FFI boundaries** (`unsafe extern "C"` in `lib.rs`, loader entry points): unsafe is expected.
+- **Internal read paths** (dispatch, cache flush, method search, selector comparison):
+  should be safe functions. Use `ClassRef`, `method_list_iter`, and similar abstractions
+  to push unsafe to the point where a raw pointer is first wrapped.
+- **Internal mutation** (class construction, method addition, loader patching): unsafe is
+  acceptable since these mutate `#[repr(C)]` structs through raw pointers, but keep it
+  to the minimum necessary.
+- When adding new internal code, prefer safe `fn` over `unsafe fn`. If a function body
+  needs one unsafe operation, wrap that operation — don't mark the whole function unsafe.
+
 ## Source Layout
 
 ```
